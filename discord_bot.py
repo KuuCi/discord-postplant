@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import aiohttp
 import asyncio
@@ -18,36 +18,38 @@ intents.voice_states = True  # Required to track voice channel membership
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Store user Riot IDs (PER GUILD - users must register in each server separately)
-# Format: {"guild_id:user_id": {"riot_name": "Name", "riot_tag": "TAG", ...}}
+# Store user Riot IDs
+# Format: {discord_user_id: {"riot_name": "Name", "riot_tag": "TAG", ...}}
 user_data = {}
 
-# Track active gaming sessions (PER GUILD)
-# Format: {"guild_id:user_id": {"start_time": datetime, "is_streaming": bool, "voice_channel_id": int, "guild_id": int}}
+# Track active gaming sessions
+# Format: {discord_user_id: {"member": Member, "last_match_id": str, "voice_channel_id": int, "guild_id": int, "is_streaming": bool}}
 active_sessions = {}
 
-# Only track competitive matches
-COMPETITIVE_ONLY = True
+# Only track these game modes (set to None to track all modes)
+ALLOWED_MODES = ["competitive", "swiftplay"]
 
-# Track users who recently finished games, grouped by voice channel
-# Format: {(guild_id, voice_channel_id): {"users": [{"user_id": str, "member": Member, "session": dict}], "first_end_time": datetime, "task": Task}}
+# Rate limit: 30 requests/min = 1 request every 2 seconds
+# We poll ONE player per voice-channel-group, cycling through groups
+POLL_INTERVAL = 2.0
+
+# How long to wait for squad members to finish before announcing
+GROUP_WAIT_TIME = 15
+
+# Track which group to poll next (round-robin through unique VC groups)
+poll_index = 0
+
+# Track players who just finished, grouped by voice channel for squad announcements
+# Format: {(guild_id, voice_channel_id): {"players": [...], "task": Task}}
 pending_announcements = {}
-
-# Lock for thread-safe operations on pending_announcements
 announcement_lock = asyncio.Lock()
 
-# How long to wait for other players to finish before announcing (seconds)
-GROUP_WAIT_TIME = 30
-
-# How long to wait for match data to appear in API (seconds)
-API_WAIT_TIME = 60
-
-# File to persist user registrations
-DATA_FILE = "user_data.json"
-SETTINGS_FILE = "settings.json"
+# Data directory (use /app/data for Railway with volume, or local directory)
+DATA_DIR = os.getenv("DATA_DIR", ".")
+DATA_FILE = os.path.join(DATA_DIR, "user_data.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 # Channel IDs where win/loss announcements will be posted (per guild)
-# Format: {guild_id: channel_id}
 announcement_channels = {}
 
 
@@ -121,9 +123,16 @@ class ValorantAPI:
         if matches and len(matches) > 0:
             return matches[0]
         return None
+    
+    async def get_last_match_id(self, name: str, tag: str, region: str = "na") -> Optional[str]:
+        """Get just the match ID of the most recent match."""
+        match = await self.get_last_match(name, tag, region)
+        if match:
+            return match["metadata"]["matchid"]
+        return None
 
 
-valorant_api = ValorantAPI(os.getenv("VALORANT_API_KEY"))  # Optional API key
+valorant_api = ValorantAPI(os.getenv("VALORANT_API_KEY"))
 
 
 @bot.event
@@ -133,6 +142,10 @@ async def on_ready():
     print(f"✅ {bot.user} is online and tracking Valorant games!")
     print(f"📊 Tracking {len(user_data)} registered users")
     print(f"📢 Announcement channels set for {len(announcement_channels)} guilds")
+    
+    # Start the polling loop
+    if not match_poller.is_running():
+        match_poller.start()
     
     # Sync slash commands
     try:
@@ -144,50 +157,327 @@ async def on_ready():
 
 @bot.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
-    """Triggered when a member's presence changes (including game activity)."""
-    # Create guild-scoped key for isolation between servers
-    guild_user_key = f"{after.guild.id}:{after.id}"
+    """Triggered when a member's presence changes."""
+    user_id = str(after.id)
     
-    # Check if user is registered in THIS guild
-    if guild_user_key not in user_data:
+    # Check if user is registered
+    if user_id not in user_data:
         return
     
-    # Get Valorant activity
     before_valorant = get_valorant_activity(before)
     after_valorant = get_valorant_activity(after)
     
     # User started playing Valorant
     if not before_valorant and after_valorant:
-        # Get their current voice channel (if any)
-        voice_channel_id = None
-        if after.voice and after.voice.channel:
-            voice_channel_id = after.voice.channel.id
-        
-        active_sessions[guild_user_key] = {
-            "start_time": datetime.now(timezone.utc),
-            "is_streaming": is_streaming_valorant(after),
-            "voice_channel_id": voice_channel_id,
-            "guild_id": after.guild.id
-        }
-        print(f"🎮 {after.display_name} started playing Valorant in {after.guild.name} (VC: {voice_channel_id})")
+        await start_tracking(after)
     
-    # User stopped playing Valorant
+    # User stopped playing Valorant (backup - polling should catch match end first)
     elif before_valorant and not after_valorant:
-        if guild_user_key in active_sessions:
-            session = active_sessions.pop(guild_user_key)
-            await queue_for_announcement(after, session, guild_user_key)
+        if user_id in active_sessions:
+            print(f"👋 {after.display_name} stopped playing (presence change)")
+            # Don't remove from active_sessions yet - let the poller handle it
+            # This gives us a chance to catch the final match
 
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     """Track voice channel changes for active players."""
-    guild_user_key = f"{member.guild.id}:{member.id}"
+    user_id = str(member.id)
     
-    # Update voice channel if user is in an active session
-    if guild_user_key in active_sessions:
+    if user_id in active_sessions:
         new_vc = after.channel.id if after.channel else None
-        active_sessions[guild_user_key]["voice_channel_id"] = new_vc
+        active_sessions[user_id]["voice_channel_id"] = new_vc
         print(f"🔊 {member.display_name} moved to VC: {new_vc}")
+
+
+async def start_tracking(member: discord.Member):
+    """Start tracking a player's match."""
+    user_id = str(member.id)
+    user_info = user_data.get(user_id)
+    
+    if not user_info:
+        return
+    
+    # Get their current last match ID (so we know when a NEW one appears)
+    last_match_id = await valorant_api.get_last_match_id(
+        user_info["riot_name"],
+        user_info["riot_tag"],
+        user_info.get("region", "na")
+    )
+    
+    voice_channel_id = None
+    if member.voice and member.voice.channel:
+        voice_channel_id = member.voice.channel.id
+    
+    active_sessions[user_id] = {
+        "member": member,
+        "last_match_id": last_match_id,
+        "voice_channel_id": voice_channel_id,
+        "guild_id": member.guild.id,
+        "is_streaming": is_streaming_valorant(member),
+        "started_at": datetime.now(timezone.utc)
+    }
+    
+    print(f"🎮 Started tracking {member.display_name} (last match: {last_match_id})")
+
+
+@tasks.loop(seconds=POLL_INTERVAL)
+async def match_poller():
+    """Poll one player at a time, but scan ALL registered players in the returned match data."""
+    global poll_index
+    
+    if not active_sessions:
+        return
+    
+    user_ids = list(active_sessions.keys())
+    if not user_ids:
+        return
+    
+    # Round-robin: pick the next player to query
+    poll_index = poll_index % len(user_ids)
+    user_id = user_ids[poll_index]
+    poll_index += 1
+    
+    if user_id not in active_sessions:
+        return
+    
+    user_info = user_data.get(user_id)
+    if not user_info:
+        return
+    
+    try:
+        # Get this player's last match (returns all 10 players in the match)
+        current_match = await valorant_api.get_last_match(
+            user_info["riot_name"],
+            user_info["riot_tag"],
+            user_info.get("region", "na")
+        )
+        
+        if not current_match:
+            return
+        
+        current_match_id = current_match["metadata"]["matchid"]
+        
+        # Build a lookup of all players in this match (lowercase for comparison)
+        match_players = {}
+        for player in current_match["players"]["all_players"]:
+            key = f"{player['name'].lower()}#{player['tag'].lower()}"
+            match_players[key] = player
+        
+        # Scan ALL active sessions to find anyone in this match with a new match ID
+        players_with_new_match = []
+        
+        for check_user_id, check_session in list(active_sessions.items()):
+            check_user_info = user_data.get(check_user_id)
+            if not check_user_info:
+                continue
+            
+            # Is this player in the match we just queried?
+            player_key = f"{check_user_info['riot_name'].lower()}#{check_user_info['riot_tag'].lower()}"
+            if player_key not in match_players:
+                continue
+            
+            # Is this match NEW for them?
+            if current_match_id == check_session["last_match_id"]:
+                continue
+            
+            # Found a player with a new match!
+            players_with_new_match.append(check_user_id)
+        
+        if not players_with_new_match:
+            return
+        
+        # Check if it's an allowed mode
+        match_mode = current_match["metadata"]["mode"].lower()
+        if ALLOWED_MODES and match_mode not in ALLOWED_MODES:
+            print(f"⏭️ Skipping {match_mode} match (allowed: {ALLOWED_MODES})")
+            # Update last_match_id for all these players
+            for uid in players_with_new_match:
+                if uid in active_sessions:
+                    active_sessions[uid]["last_match_id"] = current_match_id
+            return
+        
+        print(f"🏁 New match detected: {current_match_id} ({len(players_with_new_match)} registered player(s))")
+        
+        # Remove from active sessions and queue for announcement
+        for uid in players_with_new_match:
+            if uid not in active_sessions:
+                continue
+            
+            player_session = active_sessions.pop(uid)
+            member = player_session["member"]
+            
+            await queue_for_announcement(member, player_session, current_match)
+            
+    except Exception as e:
+        print(f"❌ Error polling: {e}")
+
+
+@match_poller.before_loop
+async def before_poller():
+    await bot.wait_until_ready()
+
+
+async def queue_for_announcement(member: discord.Member, session: dict, match: dict):
+    """Queue a player for grouped announcement by match ID."""
+    user_id = str(member.id)
+    match_id = match["metadata"]["matchid"]
+    guild_id = session.get("guild_id")
+    
+    # Group by match ID - all players in same match get one announcement
+    group_key = (guild_id, match_id)
+    
+    player_data = {
+        "user_id": user_id,
+        "member": member,
+        "session": session,
+        "match": match,
+        "user_info": user_data.get(user_id)
+    }
+    
+    async with announcement_lock:
+        if group_key not in pending_announcements:
+            pending_announcements[group_key] = {
+                "players": [],
+                "task": None
+            }
+        
+        pending_announcements[group_key]["players"].append(player_data)
+        print(f"📋 Queued {member.display_name} for match {match_id[:8]}... ({len(pending_announcements[group_key]['players'])} player(s))")
+        
+        # Cancel existing timer and restart (wait for more players from same match)
+        if pending_announcements[group_key]["task"]:
+            pending_announcements[group_key]["task"].cancel()
+        
+        pending_announcements[group_key]["task"] = asyncio.create_task(
+            process_group_announcement(group_key)
+        )
+
+
+async def process_group_announcement(group_key: tuple):
+    """Wait for all players in match to be detected, then announce."""
+    await asyncio.sleep(GROUP_WAIT_TIME)
+    
+    async with announcement_lock:
+        if group_key not in pending_announcements:
+            return
+        group_data = pending_announcements.pop(group_key)
+    
+    players = group_data["players"]
+    print(f"📢 Announcing match result for {len(players)} player(s)")
+    
+    await create_announcement(players)
+
+
+async def create_announcement(players_in_match: list):
+    """Create announcement embed for players in the same match."""
+    if not players_in_match:
+        return
+    
+    match = players_in_match[0]["match"]
+    map_name = match["metadata"]["map"]
+    game_mode = match["metadata"]["mode"]
+    teams = match["teams"]
+    red_score = teams["red"]["rounds_won"]
+    blue_score = teams["blue"]["rounds_won"]
+    
+    # Collect player stats
+    player_stats = []
+    any_streaming = False
+    
+    for p in players_in_match:
+        member = p["member"]
+        session = p["session"]
+        user_info = p["user_info"]
+        
+        if session.get("is_streaming"):
+            any_streaming = True
+        
+        # Find player in match data
+        player_data = None
+        for player in match["players"]["all_players"]:
+            if (player["name"].lower() == user_info["riot_name"].lower() and
+                player["tag"].lower() == user_info["riot_tag"].lower()):
+                player_data = player
+                break
+        
+        if player_data:
+            team = player_data["team"].lower()
+            won = teams[team]["has_won"]
+            
+            player_stats.append({
+                "member": member,
+                "player_data": player_data,
+                "team": team,
+                "won": won,
+                "riot_id": f"{user_info['riot_name']}#{user_info['riot_tag']}"
+            })
+    
+    if not player_stats:
+        return
+    
+    # Determine overall result
+    overall_won = player_stats[0]["won"]
+    teams_in_party = set(ps["team"] for ps in player_stats)
+    mixed_teams = len(teams_in_party) > 1
+    
+    # Create embed
+    if len(player_stats) == 1:
+        title = "🎮 Valorant Match Complete!"
+    else:
+        title = f"🎮 Squad Match Complete! ({len(player_stats)} players)"
+    
+    embed = discord.Embed(
+        title=title,
+        color=discord.Color.gold() if mixed_teams else (discord.Color.green() if overall_won else discord.Color.red()),
+        timestamp=datetime.now(timezone.utc)
+    )
+    
+    embed.add_field(name="Map", value=map_name, inline=True)
+    embed.add_field(name="Mode", value=game_mode, inline=True)
+    embed.add_field(name="Score", value=f"🔴 {red_score} - {blue_score} 🔵", inline=True)
+    
+    embed.add_field(name="\u200b", value="**Player Stats**", inline=False)
+    
+    for ps in player_stats:
+        player_data = ps["player_data"]
+        result_emoji = "🏆" if ps["won"] else "💀"
+        team_emoji = "🔴" if ps["team"] == "red" else "🔵"
+        
+        kills = player_data["stats"]["kills"]
+        deaths = player_data["stats"]["deaths"]
+        assists = player_data["stats"]["assists"]
+        agent = player_data["character"]
+        kda = (kills + assists) / max(deaths, 1)
+        
+        player_line = f"{result_emoji} {team_emoji} **{agent}** | K/D/A: **{kills}/{deaths}/{assists}** ({kda:.2f})"
+        
+        embed.add_field(
+            name=f"{ps['member'].display_name}",
+            value=player_line,
+            inline=False
+        )
+    
+    streaming_note = " 📺 Streaming" if any_streaming else ""
+    riot_ids = ", ".join(ps["riot_id"] for ps in player_stats)
+    embed.set_footer(text=f"{riot_ids}{streaming_note}")
+    
+    # Send to announcement channel
+    guild = player_stats[0]["member"].guild
+    channel_id = announcement_channels.get(guild.id)
+    
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if channel:
+            mentions = " ".join(ps["member"].mention for ps in player_stats)
+            await channel.send(content=mentions, embed=embed)
+    
+    # DM each player
+    for ps in player_stats:
+        try:
+            await ps["member"].send(embed=embed)
+        except discord.Forbidden:
+            pass
 
 
 def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
@@ -209,243 +499,12 @@ def is_streaming_valorant(member: discord.Member) -> bool:
     return False
 
 
-async def queue_for_announcement(member: discord.Member, session: dict, guild_user_key: str):
-    """Queue a player for grouped announcement based on voice channel."""
-    voice_channel_id = session.get("voice_channel_id")
-    guild_id = session.get("guild_id")
-    
-    # Create a group key - use voice channel if available, otherwise use a unique key per user
-    if voice_channel_id:
-        group_key = (guild_id, voice_channel_id)
-    else:
-        # Solo player not in voice - use unique key
-        group_key = (guild_id, f"solo_{guild_user_key}")
-    
-    async with announcement_lock:
-        if group_key not in pending_announcements:
-            # First player in this group to finish
-            pending_announcements[group_key] = {
-                "users": [],
-                "first_end_time": datetime.now(timezone.utc),
-                "task": None
-            }
-        
-        # Add this player to the group
-        pending_announcements[group_key]["users"].append({
-            "guild_user_key": guild_user_key,
-            "member": member,
-            "session": session
-        })
-        
-        print(f"📋 Queued {member.display_name} for announcement (group: {group_key}, total: {len(pending_announcements[group_key]['users'])})")
-        
-        # Cancel existing task if any (we'll restart the timer)
-        if pending_announcements[group_key]["task"]:
-            pending_announcements[group_key]["task"].cancel()
-        
-        # Start/restart the countdown for this group
-        pending_announcements[group_key]["task"] = asyncio.create_task(
-            process_group_announcement(group_key)
-        )
-
-
-async def process_group_announcement(group_key: tuple):
-    """Wait for group to assemble, then process announcement."""
-    # Wait for other players to finish their games
-    await asyncio.sleep(GROUP_WAIT_TIME)
-    
-    async with announcement_lock:
-        if group_key not in pending_announcements:
-            return
-        
-        group_data = pending_announcements.pop(group_key)
-    
-    users = group_data["users"]
-    print(f"⏰ Processing announcement for {len(users)} player(s)")
-    
-    # Wait for API to update
-    await asyncio.sleep(API_WAIT_TIME)
-    
-    # Fetch match data for all players
-    player_matches = []
-    
-    for user_entry in users:
-        guild_user_key = user_entry["guild_user_key"]
-        member = user_entry["member"]
-        session = user_entry["session"]
-        
-        if guild_user_key not in user_data:
-            continue
-        
-        user_info = user_data[guild_user_key]
-        match = await valorant_api.get_last_match(
-            user_info["riot_name"],
-            user_info["riot_tag"],
-            user_info.get("region", "na")
-        )
-        
-        if match:
-            # Filter for competitive only
-            if COMPETITIVE_ONLY and match["metadata"]["mode"].lower() != "competitive":
-                print(f"⏭️ Skipping non-competitive match for {member.display_name} (mode: {match['metadata']['mode']})")
-                continue
-            
-            player_matches.append({
-                "member": member,
-                "session": session,
-                "user_info": user_info,
-                "match": match
-            })
-    
-    if not player_matches:
-        print("❌ No competitive match data found for any player in group")
-        return
-    
-    # Group players by match ID
-    matches_by_id = defaultdict(list)
-    for pm in player_matches:
-        match_id = pm["match"]["metadata"]["matchid"]
-        matches_by_id[match_id].append(pm)
-    
-    # Create announcements for each unique match
-    for match_id, players_in_match in matches_by_id.items():
-        await create_group_announcement(players_in_match)
-
-
-async def create_group_announcement(players_in_match: list):
-    """Create a single announcement for all players in the same match."""
-    if not players_in_match:
-        return
-    
-    # Use the first player's match data for common info
-    match = players_in_match[0]["match"]
-    
-    map_name = match["metadata"]["map"]
-    game_mode = match["metadata"]["mode"]
-    
-    teams = match["teams"]
-    red_score = teams["red"]["rounds_won"]
-    blue_score = teams["blue"]["rounds_won"]
-    
-    # Collect player stats
-    player_stats = []
-    any_streaming = False
-    
-    for pm in players_in_match:
-        member = pm["member"]
-        session = pm["session"]
-        user_info = pm["user_info"]
-        
-        if session.get("is_streaming"):
-            any_streaming = True
-        
-        # Find player in match data
-        player_data = None
-        for player in match["players"]["all_players"]:
-            if (player["name"].lower() == user_info["riot_name"].lower() and 
-                player["tag"].lower() == user_info["riot_tag"].lower()):
-                player_data = player
-                break
-        
-        if player_data:
-            team = player_data["team"].lower()
-            won = teams[team]["has_won"]
-            
-            player_stats.append({
-                "member": member,
-                "player_data": player_data,
-                "team": team,
-                "won": won,
-                "riot_id": f"{user_info['riot_name']}#{user_info['riot_tag']}"
-            })
-    
-    if not player_stats:
-        return
-    
-    # Determine overall result (use first player's result for embed color)
-    overall_won = player_stats[0]["won"]
-    
-    # Check if all players are on the same team
-    teams_in_party = set(ps["team"] for ps in player_stats)
-    mixed_teams = len(teams_in_party) > 1
-    
-    # Create embed
-    if len(player_stats) == 1:
-        title = "🎮 Valorant Match Complete!"
-    else:
-        title = f"🎮 Squad Match Complete! ({len(player_stats)} players)"
-    
-    embed = discord.Embed(
-        title=title,
-        color=discord.Color.gold() if mixed_teams else (discord.Color.green() if overall_won else discord.Color.red()),
-        timestamp=datetime.now(timezone.utc)
-    )
-    
-    # Add match info
-    embed.add_field(name="Map", value=map_name, inline=True)
-    embed.add_field(name="Mode", value=game_mode, inline=True)
-    embed.add_field(name="Score", value=f"🔴 {red_score} - {blue_score} 🔵", inline=True)
-    
-    # Add each player's stats
-    embed.add_field(name="\u200b", value="**Player Stats**", inline=False)
-    
-    for ps in player_stats:
-        player_data = ps["player_data"]
-        result_emoji = "🏆" if ps["won"] else "💀"
-        team_emoji = "🔴" if ps["team"] == "red" else "🔵"
-        
-        kills = player_data["stats"]["kills"]
-        deaths = player_data["stats"]["deaths"]
-        assists = player_data["stats"]["assists"]
-        agent = player_data["character"]
-        
-        # Calculate KDA
-        kda = (kills + assists) / max(deaths, 1)
-        
-        player_line = f"{result_emoji} {team_emoji} **{agent}** | K/D/A: **{kills}/{deaths}/{assists}** (KDA: {kda:.2f})"
-        
-        embed.add_field(
-            name=f"{ps['member'].display_name}",
-            value=player_line,
-            inline=False
-        )
-    
-    # Footer
-    streaming_note = " 📺 Streaming" if any_streaming else ""
-    riot_ids = ", ".join(ps["riot_id"] for ps in player_stats)
-    embed.set_footer(text=f"{riot_ids}{streaming_note}")
-    
-    # Send to announcement channel
-    guild = player_stats[0]["member"].guild
-    channel_id = announcement_channels.get(guild.id)
-    
-    if channel_id:
-        channel = guild.get_channel(channel_id)
-        if channel:
-            # Mention all players
-            mentions = " ".join(ps["member"].mention for ps in player_stats)
-            await channel.send(content=mentions, embed=embed)
-    
-    # DM each player
-    for ps in player_stats:
-        try:
-            await ps["member"].send(embed=embed)
-        except discord.Forbidden:
-            pass
-
-
-async def check_match_result(member: discord.Member, session: dict):
-    """Legacy function - now handled by group announcements."""
-    # This is kept for compatibility but the main logic is in create_group_announcement
-    pass
-
-
 # Slash Commands
 @bot.tree.command(name="register", description="Register your Riot ID to track Valorant games")
 @app_commands.describe(
     riot_name="Your Riot username (e.g., PlayerName)",
     riot_tag="Your Riot tag (e.g., NA1)",
-    region="Your region (na, eu, ap, kr)"
+    region="Your region"
 )
 @app_commands.choices(region=[
     app_commands.Choice(name="North America", value="na"),
@@ -454,10 +513,9 @@ async def check_match_result(member: discord.Member, session: dict):
     app_commands.Choice(name="Korea", value="kr"),
 ])
 async def register(interaction: discord.Interaction, riot_name: str, riot_tag: str, region: str = "na"):
-    """Register your Riot ID for tracking in this server."""
+    """Register your Riot ID for tracking."""
     await interaction.response.defer(ephemeral=True)
     
-    # Verify the account exists
     account = await valorant_api.get_account(riot_name, riot_tag)
     
     if not account:
@@ -467,9 +525,8 @@ async def register(interaction: discord.Interaction, riot_name: str, riot_tag: s
         )
         return
     
-    # Use guild-scoped key for server isolation
-    guild_user_key = f"{interaction.guild.id}:{interaction.user.id}"
-    user_data[guild_user_key] = {
+    user_id = str(interaction.user.id)
+    user_data[user_id] = {
         "riot_name": riot_name,
         "riot_tag": riot_tag,
         "region": region,
@@ -478,40 +535,72 @@ async def register(interaction: discord.Interaction, riot_name: str, riot_tag: s
     save_user_data()
     
     await interaction.followup.send(
-        f"✅ Successfully registered **{riot_name}#{riot_tag}** ({region.upper()}) in **{interaction.guild.name}**!\n"
-        f"I'll now track your Competitive Valorant games and report results in this server.",
+        f"✅ Successfully registered **{riot_name}#{riot_tag}** ({region.upper()})!\n"
+        f"I'll now track your Valorant matches ({', '.join(ALLOWED_MODES) if ALLOWED_MODES else 'all modes'}).",
         ephemeral=True
     )
 
 
-@bot.tree.command(name="unregister", description="Stop tracking your Valorant games in this server")
+@bot.tree.command(name="unregister", description="Stop tracking your Valorant games")
 async def unregister(interaction: discord.Interaction):
-    """Unregister from tracking in this server."""
-    guild_user_key = f"{interaction.guild.id}:{interaction.user.id}"
+    """Unregister from tracking."""
+    user_id = str(interaction.user.id)
     
-    if guild_user_key in user_data:
-        del user_data[guild_user_key]
+    if user_id in user_data:
+        del user_data[user_id]
         save_user_data()
-        await interaction.response.send_message(
-            f"✅ You've been unregistered from **{interaction.guild.name}**. Your games will no longer be tracked here.",
-            ephemeral=True
-        )
+        if user_id in active_sessions:
+            del active_sessions[user_id]
+        await interaction.response.send_message("✅ Unregistered. Your games will no longer be tracked.", ephemeral=True)
     else:
-        await interaction.response.send_message("❌ You're not currently registered in this server.", ephemeral=True)
+        await interaction.response.send_message("❌ You're not registered.", ephemeral=True)
 
 
-@bot.tree.command(name="stats", description="Check your recent Valorant Competitive stats")
-async def stats(interaction: discord.Interaction):
-    """Get your recent competitive stats."""
-    await interaction.response.defer()
-    
-    guild_user_key = f"{interaction.guild.id}:{interaction.user.id}"
-    
-    if guild_user_key not in user_data:
-        await interaction.followup.send("❌ You're not registered in this server. Use `/register` first!")
+@bot.tree.command(name="setchannel", description="Set the channel for match announcements (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Set the announcement channel for this server."""
+    announcement_channels[interaction.guild.id] = channel.id
+    save_settings()
+    await interaction.response.send_message(f"✅ Match announcements will be posted in {channel.mention}")
+
+
+@bot.tree.command(name="status", description="Check who is currently being tracked")
+async def status(interaction: discord.Interaction):
+    """Show currently tracked players."""
+    if not active_sessions:
+        await interaction.response.send_message("No one is currently being tracked.", ephemeral=True)
         return
     
-    user_info = user_data[guild_user_key]
+    lines = []
+    for user_id, session in active_sessions.items():
+        member = session["member"]
+        vc = "in VC" if session.get("voice_channel_id") else "solo"
+        lines.append(f"• {member.display_name} ({vc})")
+    
+    num_players = len(active_sessions)
+    poll_cycle = POLL_INTERVAL * num_players
+    
+    await interaction.response.send_message(
+        f"**Tracking {num_players} player(s):**\n" + 
+        "\n".join(lines) + 
+        f"\n\n_Full poll cycle: {poll_cycle:.0f}s (1 API call detects all players in same match)_",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="stats", description="Check your recent Valorant stats")
+async def stats(interaction: discord.Interaction):
+    """Get your recent stats."""
+    await interaction.response.defer()
+    
+    user_id = str(interaction.user.id)
+    
+    if user_id not in user_data:
+        await interaction.followup.send("❌ You're not registered. Use `/register` first!")
+        return
+    
+    user_info = user_data[user_id]
     matches = await valorant_api.get_recent_matches(
         user_info["riot_name"],
         user_info["riot_tag"],
@@ -522,21 +611,22 @@ async def stats(interaction: discord.Interaction):
         await interaction.followup.send("❌ Could not fetch your match history.")
         return
     
-    # Filter for competitive matches only
-    comp_matches = [m for m in matches if m["metadata"]["mode"].lower() == "competitive"][:5]
+    # Filter to allowed modes only
+    if ALLOWED_MODES:
+        filtered_matches = [m for m in matches if m["metadata"]["mode"].lower() in ALLOWED_MODES][:5]
+    else:
+        filtered_matches = matches[:5]
     
-    if not comp_matches:
-        await interaction.followup.send("❌ No recent competitive matches found.")
+    if not filtered_matches:
+        await interaction.followup.send(f"❌ No recent {'/'.join(ALLOWED_MODES) if ALLOWED_MODES else ''} matches found.")
         return
     
-    # Calculate stats from recent competitive matches
     wins = 0
     total_kills = 0
     total_deaths = 0
     total_assists = 0
-    match_count = len(comp_matches)
     
-    for match in comp_matches:
+    for match in filtered_matches:
         for player in match["players"]["all_players"]:
             if player["name"].lower() == user_info["riot_name"].lower():
                 total_kills += player["stats"]["kills"]
@@ -548,93 +638,15 @@ async def stats(interaction: discord.Interaction):
                     wins += 1
                 break
     
+    num_matches = len(filtered_matches)
     embed = discord.Embed(
-        title=f"📊 Recent Competitive Stats for {user_info['riot_name']}#{user_info['riot_tag']}",
+        title=f"📊 Recent Stats",
+        description=f"**{user_info['riot_name']}#{user_info['riot_tag']}**",
         color=discord.Color.blurple()
     )
-    embed.add_field(name=f"Last {match_count} Comp Games", value=f"{wins}W - {match_count-wins}L", inline=True)
+    embed.add_field(name=f"Last {num_matches} Games", value=f"{wins}W - {num_matches - wins}L", inline=True)
     embed.add_field(name="Total K/D/A", value=f"{total_kills}/{total_deaths}/{total_assists}", inline=True)
-    embed.add_field(name="Avg K/D", value=f"{total_kills/match_count:.1f}/{total_deaths/match_count:.1f}", inline=True)
-    
-    await interaction.followup.send(embed=embed)
-
-
-@bot.tree.command(name="setchannel", description="Set the channel for match announcements (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    """Set the announcement channel for this server."""
-    announcement_channels[interaction.guild.id] = channel.id
-    save_settings()
-    await interaction.response.send_message(f"✅ Match announcements will now be posted in {channel.mention}")
-
-
-@bot.tree.command(name="lastmatch", description="Get details about your last competitive match")
-async def last_match(interaction: discord.Interaction):
-    """Get your last competitive match details."""
-    await interaction.response.defer()
-    
-    guild_user_key = f"{interaction.guild.id}:{interaction.user.id}"
-    
-    if guild_user_key not in user_data:
-        await interaction.followup.send("❌ You're not registered in this server. Use `/register` first!")
-        return
-    
-    user_info = user_data[guild_user_key]
-    matches = await valorant_api.get_recent_matches(
-        user_info["riot_name"],
-        user_info["riot_tag"],
-        user_info.get("region", "na")
-    )
-    
-    if not matches:
-        await interaction.followup.send("❌ Could not fetch your match history.")
-        return
-    
-    # Find the most recent competitive match
-    match = None
-    for m in matches:
-        if m["metadata"]["mode"].lower() == "competitive":
-            match = m
-            break
-    
-    if not match:
-        await interaction.followup.send("❌ No recent competitive matches found.")
-        return
-    
-    # Find player data
-    player_data = None
-    for player in match["players"]["all_players"]:
-        if player["name"].lower() == user_info["riot_name"].lower():
-            player_data = player
-            break
-    
-    if not player_data:
-        await interaction.followup.send("❌ Could not find your data in the match.")
-        return
-    
-    team = player_data["team"].lower()
-    won = match["teams"][team]["has_won"]
-    
-    embed = discord.Embed(
-        title="🎮 Last Competitive Match",
-        color=discord.Color.green() if won else discord.Color.red()
-    )
-    
-    result = "🏆 Victory" if won else "💀 Defeat"
-    red_score = match["teams"]["red"]["rounds_won"]
-    blue_score = match["teams"]["blue"]["rounds_won"]
-    score = f"{red_score}-{blue_score}" if team == "red" else f"{blue_score}-{red_score}"
-    
-    embed.add_field(name="Result", value=result, inline=True)
-    embed.add_field(name="Score", value=score, inline=True)
-    embed.add_field(name="Map", value=match["metadata"]["map"], inline=True)
-    embed.add_field(name="Agent", value=player_data["character"], inline=True)
-    embed.add_field(
-        name="K/D/A",
-        value=f"{player_data['stats']['kills']}/{player_data['stats']['deaths']}/{player_data['stats']['assists']}",
-        inline=True
-    )
-    embed.add_field(name="Mode", value=match["metadata"]["mode"], inline=True)
+    embed.add_field(name="Avg K/D", value=f"{total_kills/num_matches:.1f}/{total_deaths/num_matches:.1f}", inline=True)
     
     await interaction.followup.send(embed=embed)
 
