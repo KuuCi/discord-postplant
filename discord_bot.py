@@ -22,6 +22,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Format: {discord_user_id: {"riot_name": "Name", "riot_tag": "TAG", ...}}
 user_data = {}
 
+# User balances for betting
+# Format: {discord_user_id: {"balance": int, "vc_minutes_today": int, "last_daily": str, "daily_claimed": bool}}
+user_balances = {}
+STARTING_BALANCE = 100
+DAILY_BONUS = 50
+VC_MINUTES_FOR_DAILY = 30
+
+# Active betting pools
+# Format: {(guild_id, player_user_id): {"player_name": str, "bets": {"win": {}, "loss": {}}, "closes_at": datetime, "message": Message}}
+active_bets = {}
+BETTING_WINDOW = 180  # 3 minutes in seconds
+
 # Track active gaming sessions
 # Format: {discord_user_id: {"member": Member, "last_match_id": str, "voice_channel_id": int, "guild_id": int, "started_at": datetime}}
 active_sessions = {}
@@ -47,6 +59,7 @@ announcement_lock = asyncio.Lock()
 DATA_DIR = os.getenv("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "user_data.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+BALANCES_FILE = os.path.join(DATA_DIR, "balances.json")
 
 # Channel IDs where win/loss announcements will be posted (per guild)
 announcement_channels = {}
@@ -83,6 +96,54 @@ def save_settings():
     """Save settings to file."""
     with open(SETTINGS_FILE, "w") as f:
         json.dump({"announcement_channels": announcement_channels}, f, indent=2)
+
+
+def load_balances():
+    """Load user balances from file."""
+    global user_balances
+    if os.path.exists(BALANCES_FILE):
+        with open(BALANCES_FILE, "r") as f:
+            user_balances = json.load(f)
+    else:
+        user_balances = {}
+
+
+def save_balances():
+    """Save user balances to file."""
+    with open(BALANCES_FILE, "w") as f:
+        json.dump(user_balances, f, indent=2)
+
+
+def get_balance(user_id: str) -> int:
+    """Get a user's balance, creating account if needed."""
+    if user_id not in user_balances:
+        user_balances[user_id] = {
+            "balance": STARTING_BALANCE,
+            "vc_minutes_today": 0,
+            "last_vc_check": None,
+            "daily_claimed": False,
+            "last_daily_date": None
+        }
+        save_balances()
+    return user_balances[user_id]["balance"]
+
+
+def update_balance(user_id: str, amount: int):
+    """Update a user's balance by amount (can be negative)."""
+    get_balance(user_id)  # Ensure account exists
+    user_balances[user_id]["balance"] += amount
+    if user_balances[user_id]["balance"] < 0:
+        user_balances[user_id]["balance"] = 0
+    save_balances()
+    return user_balances[user_id]["balance"]
+
+
+def set_balance(user_id: str, amount: int):
+    """Set a user's balance to a specific amount."""
+    get_balance(user_id)  # Ensure account exists
+    user_balances[user_id]["balance"] = max(0, amount)
+    save_balances()
+    return user_balances[user_id]["balance"]
 
 
 class ValorantAPI:
@@ -156,6 +217,7 @@ valorant_api = ValorantAPI(os.getenv("VALORANT_API_KEY"))
 async def on_ready():
     load_user_data()
     load_settings()
+    load_balances()
     print(f"{'='*50}")
     print(f"✅ {bot.user} is online!")
     print(f"{'='*50}")
@@ -170,6 +232,7 @@ async def on_ready():
         print(f"   └─ Guild {gid}: Channel {cid}")
     print(f"🎮 Tracking modes: {ALLOWED_MODES if ALLOWED_MODES else 'all'}")
     print(f"⏱️ Poll interval: {POLL_INTERVAL}s")
+    print(f"💰 Users with balances: {len(user_balances)}")
     print(f"🔗 Connected to {len(bot.guilds)} guild(s):")
     for guild in bot.guilds:
         print(f"   └─ {guild.name} ({guild.id}) - {guild.member_count} members")
@@ -244,13 +307,62 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Track voice channel changes for active players."""
+    """Track voice channel changes for active players and VC time for daily bonus."""
     user_id = str(member.id)
     
+    # Track VC for active sessions
     if user_id in active_sessions:
         new_vc = after.channel.id if after.channel else None
         active_sessions[user_id]["voice_channel_id"] = new_vc
         print(f"🔊 {member.display_name} moved to VC: {new_vc}")
+    
+    # Track VC time for daily bonus
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    
+    # Ensure user has balance data
+    get_balance(user_id)
+    user_bal = user_balances[user_id]
+    
+    # Reset daily tracking if it's a new day
+    if user_bal.get("last_daily_date") != today:
+        user_bal["vc_minutes_today"] = 0
+        user_bal["daily_claimed"] = False
+        user_bal["last_daily_date"] = today
+    
+    # User joined VC
+    if before.channel is None and after.channel is not None:
+        user_bal["vc_join_time"] = now.isoformat()
+        save_balances()
+    
+    # User left VC
+    elif before.channel is not None and after.channel is None:
+        if user_bal.get("vc_join_time"):
+            try:
+                join_time = datetime.fromisoformat(user_bal["vc_join_time"])
+                minutes = int((now - join_time).total_seconds() / 60)
+                user_bal["vc_minutes_today"] = user_bal.get("vc_minutes_today", 0) + minutes
+                user_bal["vc_join_time"] = None
+                save_balances()
+                print(f"⏱️ {member.display_name} spent {minutes} min in VC (total today: {user_bal['vc_minutes_today']})")
+                
+                # Auto-claim daily bonus if eligible
+                if not user_bal.get("daily_claimed") and user_bal.get("vc_minutes_today", 0) >= VC_MINUTES_FOR_DAILY:
+                    user_bal["daily_claimed"] = True
+                    new_balance = update_balance(user_id, DAILY_BONUS)
+                    print(f"🎁 Auto-claimed daily bonus for {member.display_name}")
+                    
+                    # Announce in channel (no ping)
+                    guild = member.guild
+                    channel_id = announcement_channels.get(guild.id)
+                    if channel_id:
+                        channel = guild.get_channel(channel_id)
+                        if channel:
+                            await channel.send(
+                                f"🎁 **{member.display_name}** earned their daily bonus! +**{DAILY_BONUS}** coins (Balance: {new_balance})"
+                            )
+            except:
+                pass
 
 
 async def start_tracking(member: discord.Member):
@@ -283,6 +395,9 @@ async def start_tracking(member: discord.Member):
     }
     
     print(f"✅ Now tracking {member.display_name} | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
+    
+    # Open betting for this player
+    await open_betting(member, user_info)
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -538,8 +653,7 @@ async def create_announcement(players_in_match: list):
     if channel_id:
         channel = guild.get_channel(channel_id)
         if channel:
-            mentions = " ".join(ps["member"].mention for ps in player_stats)
-            await channel.send(content=mentions, embed=embed)
+            await channel.send(embed=embed)
             print(f"✅ Announcement sent to #{channel.name}")
         else:
             print(f"❌ Could not find announcement channel {channel_id}")
@@ -553,6 +667,12 @@ async def create_announcement(players_in_match: list):
             print(f"✅ DM sent to {ps['member'].display_name}")
         except discord.Forbidden:
             print(f"⚠️ Could not DM {ps['member'].display_name} (DMs disabled)")
+    
+    # Resolve bets for each player
+    for ps in player_stats:
+        bet_key = (guild.id, str(ps["member"].id))
+        outcome = "win" if ps["won"] else "loss"
+        await resolve_bets(bet_key, outcome)
 
 
 def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
@@ -565,6 +685,261 @@ def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
             if isinstance(activity, discord.Activity) and "valorant" in activity_name.lower():
                 return activity
     return None
+
+
+# ==================== BETTING SYSTEM ====================
+
+async def open_betting(member: discord.Member, user_info: dict):
+    """Open betting for a player's match."""
+    guild = member.guild
+    channel_id = announcement_channels.get(guild.id)
+    
+    if not channel_id:
+        return
+    
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    
+    bet_key = (guild.id, str(member.id))
+    closes_at = datetime.now(timezone.utc).timestamp() + BETTING_WINDOW
+    
+    active_bets[bet_key] = {
+        "player_name": member.display_name,
+        "player_riot_id": f"{user_info['riot_name']}#{user_info['riot_tag']}",
+        "bets": {"win": {}, "loss": {}},
+        "closes_at": closes_at,
+        "message": None,
+        "guild_id": guild.id
+    }
+    
+    embed = discord.Embed(
+        title=f"🎰 Betting Open: {member.display_name}",
+        description=f"**{user_info['riot_name']}#{user_info['riot_tag']}** just started a match!\n\n"
+                    f"Place your bets with `/bet`\n"
+                    f"Betting closes <t:{int(closes_at)}:R>",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="💰 Win Pool", value="0 coins (0 bets)", inline=True)
+    embed.add_field(name="💀 Loss Pool", value="0 coins (0 bets)", inline=True)
+    embed.add_field(name="📊 Win Odds", value="--", inline=True)
+    embed.set_footer(text="House takes 10% • Use /bet to place your wager")
+    
+    msg = await channel.send(embed=embed)
+    active_bets[bet_key]["message"] = msg
+    
+    print(f"🎰 Betting opened for {member.display_name}")
+    
+    # Schedule betting close
+    asyncio.create_task(close_betting_after_delay(bet_key, BETTING_WINDOW))
+
+
+async def close_betting_after_delay(bet_key: tuple, delay: int):
+    """Close betting after the delay."""
+    await asyncio.sleep(delay)
+    await close_betting(bet_key)
+
+
+async def close_betting(bet_key: tuple):
+    """Close betting for a match."""
+    if bet_key not in active_bets:
+        return
+    
+    bet_data = active_bets[bet_key]
+    bet_data["closed"] = True
+    
+    # Update the message
+    if bet_data.get("message"):
+        try:
+            embed = bet_data["message"].embeds[0]
+            embed.title = f"🔒 Betting Closed: {bet_data['player_name']}"
+            embed.description = f"**{bet_data['player_riot_id']}** is in a match!\n\nBetting is now closed. Results when match ends."
+            embed.color = discord.Color.dark_gray()
+            await bet_data["message"].edit(embed=embed)
+        except:
+            pass
+    
+    print(f"🔒 Betting closed for {bet_data['player_name']}")
+
+
+async def update_betting_embed(bet_key: tuple):
+    """Update the betting embed with current pools."""
+    if bet_key not in active_bets:
+        return
+    
+    bet_data = active_bets[bet_key]
+    if not bet_data.get("message"):
+        return
+    
+    win_pool = sum(bet_data["bets"]["win"].values())
+    loss_pool = sum(bet_data["bets"]["loss"].values())
+    total_pool = win_pool + loss_pool
+    
+    win_bettors = len(bet_data["bets"]["win"])
+    loss_bettors = len(bet_data["bets"]["loss"])
+    
+    # Calculate odds (potential payout multiplier for a 1 coin bet)
+    if total_pool > 0 and win_pool > 0:
+        win_odds = f"{((total_pool * 0.9) / win_pool):.2f}x"
+    else:
+        win_odds = "--"
+    
+    if total_pool > 0 and loss_pool > 0:
+        loss_odds = f"{((total_pool * 0.9) / loss_pool):.2f}x"
+    else:
+        loss_odds = "--"
+    
+    try:
+        embed = bet_data["message"].embeds[0]
+        embed.set_field_at(0, name="💰 Win Pool", value=f"{win_pool} coins ({win_bettors} bets)", inline=True)
+        embed.set_field_at(1, name="💀 Loss Pool", value=f"{loss_pool} coins ({loss_bettors} bets)", inline=True)
+        embed.set_field_at(2, name="📊 Odds (Win/Loss)", value=f"{win_odds} / {loss_odds}", inline=True)
+        await bet_data["message"].edit(embed=embed)
+    except:
+        pass
+
+
+def calculate_payouts(bet_data: dict, outcome: str, house_cut: float = 0.10) -> dict:
+    """
+    Calculate payouts for all bettors.
+    Returns: {user_id: {"payout": int, "profit": int, "bet": int, "side": str}}
+    """
+    bets = bet_data["bets"]
+    win_pool = sum(bets["win"].values())
+    loss_pool = sum(bets["loss"].values())
+    total_pool = win_pool + loss_pool
+    
+    winning_side = "win" if outcome == "win" else "loss"
+    losing_side = "loss" if outcome == "win" else "win"
+    
+    winning_bets = bets[winning_side]
+    losing_bets = bets[losing_side]
+    winning_pool_total = sum(winning_bets.values())
+    losing_pool_total = sum(losing_bets.values())
+    
+    results = {}
+    
+    # Initialize losers
+    for uid, amount in losing_bets.items():
+        results[uid] = {"payout": 0, "profit": -amount, "bet": amount, "side": losing_side}
+    
+    # Edge case: No bets at all
+    if total_pool == 0:
+        return results
+    
+    # Edge case: No one bet on winning side - losers lose to house
+    if winning_pool_total == 0:
+        return results
+    
+    # Edge case: No one bet on losing side - winners get small bonus
+    if losing_pool_total == 0:
+        for uid, amount in winning_bets.items():
+            bonus = int(amount * 0.05)  # 5% bonus for "sure thing"
+            results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side}
+        return results
+    
+    # Edge case: Only one person bet total - return their bet + small bonus
+    if len(winning_bets) + len(losing_bets) == 1:
+        for uid, amount in winning_bets.items():
+            bonus = int(amount * 0.10)  # 10% bonus for being brave
+            results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side}
+        return results
+    
+    # Normal case: Pari-mutuel payout
+    house_take = int(total_pool * house_cut)
+    payout_pool = total_pool - house_take
+    
+    for uid, amount in winning_bets.items():
+        share = amount / winning_pool_total
+        payout = int(payout_pool * share)
+        profit = payout - amount
+        results[uid] = {"payout": payout, "profit": profit, "bet": amount, "side": winning_side}
+    
+    return results
+
+
+async def resolve_bets(bet_key: tuple, outcome: str):
+    """Resolve all bets for a completed match."""
+    if bet_key not in active_bets:
+        return
+    
+    bet_data = active_bets.pop(bet_key)
+    
+    win_pool = sum(bet_data["bets"]["win"].values())
+    loss_pool = sum(bet_data["bets"]["loss"].values())
+    total_pool = win_pool + loss_pool
+    
+    if total_pool == 0:
+        print(f"🎰 No bets placed for {bet_data['player_name']}")
+        return
+    
+    # Calculate payouts
+    payouts = calculate_payouts(bet_data, outcome)
+    
+    # Apply payouts
+    for uid, result in payouts.items():
+        if result["payout"] > 0:
+            update_balance(uid, result["payout"])
+    
+    # Create results embed
+    guild = bot.get_guild(bet_data["guild_id"])
+    channel_id = announcement_channels.get(bet_data["guild_id"])
+    
+    if not guild or not channel_id:
+        return
+    
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+    
+    outcome_emoji = "🏆" if outcome == "win" else "💀"
+    outcome_text = "WON" if outcome == "win" else "LOST"
+    
+    embed = discord.Embed(
+        title=f"🎰 Betting Results: {bet_data['player_name']} {outcome_emoji}",
+        description=f"**{bet_data['player_riot_id']}** {outcome_text} their match!",
+        color=discord.Color.green() if outcome == "win" else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    
+    # Sort by profit
+    sorted_results = sorted(payouts.items(), key=lambda x: x[1]["profit"], reverse=True)
+    
+    winners_text = []
+    losers_text = []
+    mentions = []
+    
+    for uid, result in sorted_results:
+        try:
+            member = guild.get_member(int(uid))
+            if member:
+                mentions.append(member.mention)
+                name = member.display_name
+            else:
+                name = f"User {uid[:8]}"
+        except:
+            name = f"User {uid[:8]}"
+        
+        if result["profit"] > 0:
+            winners_text.append(f"🤑 **{name}**: +{result['profit']} coins (bet {result['bet']} on {result['side']})")
+        elif result["profit"] == 0:
+            winners_text.append(f"😐 **{name}**: ±0 coins (bet {result['bet']} on {result['side']})")
+        else:
+            losers_text.append(f"😭 **{name}**: {result['profit']} coins (bet {result['bet']} on {result['side']})")
+    
+    if winners_text:
+        embed.add_field(name="Winners", value="\n".join(winners_text[:10]) or "None", inline=False)
+    if losers_text:
+        embed.add_field(name="Losers", value="\n".join(losers_text[:10]) or "None", inline=False)
+    
+    house_take = int(total_pool * 0.10) if len(payouts) > 1 else 0
+    embed.set_footer(text=f"Total pool: {total_pool} coins • House took: {house_take} coins")
+    
+    # Ping all bettors
+    ping_text = " ".join(mentions) if mentions else ""
+    await channel.send(content=ping_text, embed=embed)
+    print(f"🎰 Bets resolved for {bet_data['player_name']}: {outcome}")
 
 
 # Slash Commands
@@ -720,6 +1095,180 @@ async def stats(interaction: discord.Interaction):
     embed.add_field(name="Avg K/D", value=f"{total_kills/num_matches:.1f}/{total_deaths/num_matches:.1f}", inline=True)
     
     await interaction.followup.send(embed=embed)
+
+
+# ==================== BETTING COMMANDS ====================
+
+@bot.tree.command(name="bet", description="Place a bet on a player's match")
+@app_commands.describe(
+    player="The player to bet on",
+    outcome="Bet on win or loss",
+    amount="Amount of coins to bet"
+)
+@app_commands.choices(outcome=[
+    app_commands.Choice(name="Win", value="win"),
+    app_commands.Choice(name="Loss", value="loss"),
+])
+async def bet(interaction: discord.Interaction, player: discord.Member, outcome: str, amount: int):
+    """Place a bet on a player's match."""
+    user_id = str(interaction.user.id)
+    bet_key = (interaction.guild.id, str(player.id))
+    
+    # Check if betting is open for this player
+    if bet_key not in active_bets:
+        await interaction.response.send_message(
+            f"❌ No active betting for **{player.display_name}**. They need to be in a match!",
+            ephemeral=True
+        )
+        return
+    
+    bet_data = active_bets[bet_key]
+    
+    # Check if betting is closed
+    if bet_data.get("closed") or datetime.now(timezone.utc).timestamp() > bet_data["closes_at"]:
+        await interaction.response.send_message(
+            f"❌ Betting is closed for **{player.display_name}**'s match!",
+            ephemeral=True
+        )
+        return
+    
+    # Validate amount
+    if amount <= 0:
+        await interaction.response.send_message("❌ Bet amount must be positive!", ephemeral=True)
+        return
+    
+    balance = get_balance(user_id)
+    if amount > balance:
+        await interaction.response.send_message(
+            f"❌ You only have **{balance}** coins! Use `/balance` to check.",
+            ephemeral=True
+        )
+        return
+    
+    # Check if user already bet
+    existing_bet = None
+    for side in ["win", "loss"]:
+        if user_id in bet_data["bets"][side]:
+            existing_bet = (side, bet_data["bets"][side][user_id])
+            break
+    
+    if existing_bet:
+        await interaction.response.send_message(
+            f"❌ You already bet **{existing_bet[1]}** coins on **{existing_bet[0]}**! "
+            f"One bet per match.",
+            ephemeral=True
+        )
+        return
+    
+    # Place the bet
+    update_balance(user_id, -amount)
+    bet_data["bets"][outcome][user_id] = amount
+    
+    # Update the betting embed
+    await update_betting_embed(bet_key)
+    
+    # Calculate potential payout
+    win_pool = sum(bet_data["bets"]["win"].values())
+    loss_pool = sum(bet_data["bets"]["loss"].values())
+    total_pool = win_pool + loss_pool
+    my_pool = win_pool if outcome == "win" else loss_pool
+    
+    if my_pool > 0:
+        potential_multiplier = (total_pool * 0.9) / my_pool
+        potential_payout = int(amount * potential_multiplier)
+    else:
+        potential_payout = amount
+    
+    new_balance = get_balance(user_id)
+    
+    await interaction.response.send_message(
+        f"✅ Bet placed!\n\n"
+        f"**{amount}** coins on **{player.display_name}** to **{outcome.upper()}**\n"
+        f"Potential payout: ~**{potential_payout}** coins (odds may change)\n"
+        f"Your balance: **{new_balance}** coins",
+        ephemeral=True
+    )
+    
+    print(f"🎰 {interaction.user.display_name} bet {amount} on {player.display_name} to {outcome}")
+
+
+@bot.tree.command(name="balance", description="Check your coin balance")
+async def balance(interaction: discord.Interaction):
+    """Check your coin balance."""
+    user_id = str(interaction.user.id)
+    bal = get_balance(user_id)
+    
+    # Check if daily is available
+    user_bal = user_balances.get(user_id, {})
+    vc_minutes = user_bal.get("vc_minutes_today", 0)
+    daily_claimed = user_bal.get("daily_claimed", False)
+    
+    embed = discord.Embed(
+        title=f"💰 {interaction.user.display_name}'s Balance",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Coins", value=f"**{bal}** 🪙", inline=True)
+    embed.add_field(name="VC Time Today", value=f"{vc_minutes} min", inline=True)
+    
+    if daily_claimed:
+        embed.add_field(name="Daily Bonus", value="✅ Claimed", inline=True)
+    else:
+        remaining = max(0, VC_MINUTES_FOR_DAILY - vc_minutes)
+        embed.add_field(name="Daily Bonus", value=f"⏳ {remaining} more min in VC", inline=True)
+    
+    embed.set_footer(text="Daily bonus auto-claims when you leave VC with 30+ min")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="leaderboard", description="View the coin leaderboard")
+async def leaderboard(interaction: discord.Interaction):
+    """Show top coin holders."""
+    if not user_balances:
+        await interaction.response.send_message("No one has any coins yet!", ephemeral=True)
+        return
+    
+    # Sort by balance
+    sorted_users = sorted(
+        user_balances.items(),
+        key=lambda x: x[1].get("balance", 0),
+        reverse=True
+    )[:10]
+    
+    embed = discord.Embed(
+        title="🏆 Coin Leaderboard",
+        color=discord.Color.gold()
+    )
+    
+    lines = []
+    for i, (uid, data) in enumerate(sorted_users, 1):
+        try:
+            member = interaction.guild.get_member(int(uid))
+            name = member.display_name if member else f"User {uid[:8]}"
+        except:
+            name = f"User {uid[:8]}"
+        
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        lines.append(f"{medal} **{name}**: {data.get('balance', 0)} coins")
+    
+    embed.description = "\n".join(lines) or "No users found"
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="give", description="Give coins to another user (Admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def give(interaction: discord.Interaction, user: discord.Member, amount: int):
+    """Give coins to a user (admin only)."""
+    user_id = str(user.id)
+    new_balance = update_balance(user_id, amount)
+    
+    await interaction.response.send_message(
+        f"✅ Gave **{amount}** coins to **{user.display_name}**\n"
+        f"Their new balance: **{new_balance}** coins"
+    )
+    
+    print(f"💰 Admin {interaction.user.display_name} gave {amount} coins to {user.display_name}")
 
 
 # Run the bot
