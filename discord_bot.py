@@ -29,9 +29,8 @@ active_sessions = {}
 # Only track these game modes (set to None to track all modes)
 ALLOWED_MODES = ["competitive", "swiftplay"]
 
-# Rate limit: 30 requests/min = 1 request every 2 seconds
-# We poll ONE player per voice-channel-group, cycling through groups
-POLL_INTERVAL = 2.0
+# Rate limit: 30 requests/min - polling every 30 seconds to stay safe
+POLL_INTERVAL = 30.0
 
 # How long to wait for squad members to finish before announcing
 GROUP_WAIT_TIME = 15
@@ -284,34 +283,6 @@ async def start_tracking(member: discord.Member):
     }
     
     print(f"✅ Now tracking {member.display_name} | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
-    
-    # Announce that player started a game
-    await announce_game_start(member, user_info)
-
-
-async def announce_game_start(member: discord.Member, user_info: dict):
-    """Announce that a player has started Valorant."""
-    guild = member.guild
-    channel_id = announcement_channels.get(guild.id)
-    
-    if not channel_id:
-        print(f"⚠️ No announcement channel set for guild {guild.name}")
-        return
-    
-    channel = guild.get_channel(channel_id)
-    if not channel:
-        print(f"❌ Could not find announcement channel {channel_id}")
-        return
-    
-    embed = discord.Embed(
-        title=f"🎮 {member.display_name} is now playing Valorant!",
-        description=f"**{user_info['riot_name']}#{user_info['riot_tag']}**",
-        color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    
-    await channel.send(embed=embed)
-    print(f"✅ Game start announcement sent for {member.display_name}")
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
