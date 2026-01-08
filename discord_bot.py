@@ -101,27 +101,45 @@ class ValorantAPI:
         """Get account info by name and tag."""
         async with aiohttp.ClientSession() as session:
             url = f"{self.BASE_URL}/valorant/v1/account/{name}/{tag}"
+            print(f"🔍 API: GET {url}")
             async with session.get(url, headers=self.headers) as resp:
+                print(f"📡 API: {resp.status}")
                 if resp.status == 200:
                     data = await resp.json()
+                    print(f"✅ API: Found account {name}#{tag}")
                     return data.get("data")
+                else:
+                    text = await resp.text()
+                    print(f"❌ API: Error - {text[:200]}")
                 return None
     
     async def get_recent_matches(self, name: str, tag: str, region: str = "na") -> Optional[list]:
         """Get recent matches for a player."""
         async with aiohttp.ClientSession() as session:
             url = f"{self.BASE_URL}/valorant/v3/matches/{region}/{name}/{tag}"
+            print(f"🔍 API: GET {url}")
             async with session.get(url, headers=self.headers) as resp:
+                print(f"📡 API: {resp.status}")
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("data", [])
+                    matches = data.get("data", [])
+                    print(f"✅ API: Got {len(matches)} matches for {name}#{tag}")
+                    return matches
+                else:
+                    text = await resp.text()
+                    print(f"❌ API: Error - {text[:200]}")
                 return None
     
     async def get_last_match(self, name: str, tag: str, region: str = "na") -> Optional[dict]:
         """Get the most recent match for a player."""
         matches = await self.get_recent_matches(name, tag, region)
         if matches and len(matches) > 0:
-            return matches[0]
+            match = matches[0]
+            mode = match["metadata"]["mode"]
+            map_name = match["metadata"]["map"]
+            match_id = match["metadata"]["matchid"][:8]
+            print(f"📋 API: Last match - {mode} on {map_name} (ID: {match_id}...)")
+            return match
         return None
     
     async def get_last_match_id(self, name: str, tag: str, region: str = "na") -> Optional[str]:
@@ -139,20 +157,28 @@ valorant_api = ValorantAPI(os.getenv("VALORANT_API_KEY"))
 async def on_ready():
     load_user_data()
     load_settings()
-    print(f"✅ {bot.user} is online and tracking Valorant games!")
-    print(f"📊 Tracking {len(user_data)} registered users")
-    print(f"📢 Announcement channels set for {len(announcement_channels)} guilds")
+    print(f"{'='*50}")
+    print(f"✅ {bot.user} is online!")
+    print(f"{'='*50}")
+    print(f"📊 Registered users: {len(user_data)}")
+    print(f"📢 Announcement channels: {len(announcement_channels)}")
+    print(f"🎮 Tracking modes: {ALLOWED_MODES if ALLOWED_MODES else 'all'}")
+    print(f"⏱️ Poll interval: {POLL_INTERVAL}s")
+    print(f"{'='*50}")
     
     # Start the polling loop
     if not match_poller.is_running():
         match_poller.start()
+        print(f"🔄 Match poller started")
     
     # Sync slash commands
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Synced {len(synced)} slash commands")
     except Exception as e:
-        print(f"Failed to sync commands: {e}")
+        print(f"❌ Failed to sync commands: {e}")
+    
+    print(f"{'='*50}")
 
 
 @bot.event
@@ -169,14 +195,14 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     
     # User started playing Valorant
     if not before_valorant and after_valorant:
+        print(f"👀 Presence: {after.display_name} started Valorant")
         await start_tracking(after)
     
     # User stopped playing Valorant (backup - polling should catch match end first)
     elif before_valorant and not after_valorant:
+        print(f"👀 Presence: {after.display_name} stopped Valorant")
         if user_id in active_sessions:
-            print(f"👋 {after.display_name} stopped playing (presence change)")
-            # Don't remove from active_sessions yet - let the poller handle it
-            # This gives us a chance to catch the final match
+            print(f"   └─ Still in active_sessions, waiting for poller to detect match end")
 
 
 @bot.event
@@ -198,6 +224,8 @@ async def start_tracking(member: discord.Member):
     if not user_info:
         return
     
+    print(f"🎮 {member.display_name} started Valorant - fetching last match ID...")
+    
     # Get their current last match ID (so we know when a NEW one appears)
     last_match_id = await valorant_api.get_last_match_id(
         user_info["riot_name"],
@@ -218,7 +246,7 @@ async def start_tracking(member: discord.Member):
         "started_at": datetime.now(timezone.utc)
     }
     
-    print(f"🎮 Started tracking {member.display_name} (last match: {last_match_id})")
+    print(f"✅ Now tracking {member.display_name} | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -244,6 +272,10 @@ async def match_poller():
     user_info = user_data.get(user_id)
     if not user_info:
         return
+    
+    session = active_sessions[user_id]
+    member = session["member"]
+    print(f"🔄 Polling {member.display_name} ({poll_index}/{len(user_ids)}) | Looking for match newer than {session['last_match_id'][:8] if session['last_match_id'] else 'None'}...")
     
     try:
         # Get this player's last match (returns all 10 players in the match)
@@ -285,6 +317,7 @@ async def match_poller():
             players_with_new_match.append(check_user_id)
         
         if not players_with_new_match:
+            print(f"⏸️ No new matches detected this poll")
             return
         
         # Check if it's an allowed mode
@@ -377,9 +410,13 @@ async def create_announcement(players_in_match: list):
     match = players_in_match[0]["match"]
     map_name = match["metadata"]["map"]
     game_mode = match["metadata"]["mode"]
+    match_id = match["metadata"]["matchid"][:8]
     teams = match["teams"]
     red_score = teams["red"]["rounds_won"]
     blue_score = teams["blue"]["rounds_won"]
+    
+    print(f"📝 Creating announcement for match {match_id}...")
+    print(f"   └─ {game_mode} on {map_name} | Score: {red_score}-{blue_score}")
     
     # Collect player stats
     player_stats = []
@@ -412,6 +449,8 @@ async def create_announcement(players_in_match: list):
                 "won": won,
                 "riot_id": f"{user_info['riot_name']}#{user_info['riot_tag']}"
             })
+            result = "WIN" if won else "LOSS"
+            print(f"   └─ {member.display_name}: {result} | {player_data['character']} | {player_data['stats']['kills']}/{player_data['stats']['deaths']}/{player_data['stats']['assists']}")
     
     if not player_stats:
         return
@@ -471,13 +510,19 @@ async def create_announcement(players_in_match: list):
         if channel:
             mentions = " ".join(ps["member"].mention for ps in player_stats)
             await channel.send(content=mentions, embed=embed)
+            print(f"✅ Announcement sent to #{channel.name}")
+        else:
+            print(f"❌ Could not find announcement channel {channel_id}")
+    else:
+        print(f"⚠️ No announcement channel set for guild {guild.name}")
     
     # DM each player
     for ps in player_stats:
         try:
             await ps["member"].send(embed=embed)
+            print(f"✅ DM sent to {ps['member'].display_name}")
         except discord.Forbidden:
-            pass
+            print(f"⚠️ Could not DM {ps['member'].display_name} (DMs disabled)")
 
 
 def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
@@ -533,6 +578,8 @@ async def register(interaction: discord.Interaction, riot_name: str, riot_tag: s
         "registered_at": datetime.now(timezone.utc).isoformat()
     }
     save_user_data()
+    
+    print(f"📝 Registered: {interaction.user.display_name} -> {riot_name}#{riot_tag} ({region})")
     
     await interaction.followup.send(
         f"✅ Successfully registered **{riot_name}#{riot_tag}** ({region.upper()})!\n"
