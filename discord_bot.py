@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 import json
 import os
+import random
 from collections import defaultdict
 
 # Bot configuration
@@ -716,7 +717,7 @@ async def open_betting(member: discord.Member, user_info: dict):
     embed.add_field(name="💰 Win Pool", value="0 coins (0 bets)", inline=True)
     embed.add_field(name="💀 Loss Pool", value="0 coins (0 bets)", inline=True)
     embed.add_field(name="📊 Win Odds", value="--", inline=True)
-    embed.set_footer(text="House takes 5% on pools 100+ coins • Use /bet to place your wager")
+    embed.set_footer(text="Win bets get 1.05-1.2x bonus • House takes 5% on pools 100+")
     
     msg = await channel.send(embed=embed)
     active_bets[bet_key]["message"] = msg
@@ -799,7 +800,8 @@ def calculate_payouts(bet_data: dict, outcome: str) -> dict:
     """
     Calculate payouts for all bettors.
     House takes 5% only on pools of 100+ coins.
-    Returns: {user_id: {"payout": int, "profit": int, "bet": int, "side": str}}
+    Win bets get a random 1.05-1.2x multiplier to encourage winning.
+    Returns: {user_id: {"payout": int, "profit": int, "bet": int, "side": str, "multiplier": float}}
     """
     bets = bet_data["bets"]
     win_pool = sum(bets["win"].values())
@@ -824,7 +826,7 @@ def calculate_payouts(bet_data: dict, outcome: str) -> dict:
     
     # Initialize losers
     for uid, amount in losing_bets.items():
-        results[uid] = {"payout": 0, "profit": -amount, "bet": amount, "side": losing_side}
+        results[uid] = {"payout": 0, "profit": -amount, "bet": amount, "side": losing_side, "multiplier": None}
     
     # Edge case: No bets at all
     if total_pool == 0:
@@ -838,14 +840,26 @@ def calculate_payouts(bet_data: dict, outcome: str) -> dict:
     if len(winning_bets) + len(losing_bets) == 1:
         for uid, amount in winning_bets.items():
             bonus = max(1, int(amount * 0.25))  # 25% bonus for being brave, min 1
-            results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side}
+            # Apply win multiplier if they bet on win
+            if winning_side == "win":
+                multiplier = round(random.uniform(1.05, 1.20), 2)
+                bonus = int(bonus * multiplier)
+            else:
+                multiplier = None
+            results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side, "multiplier": multiplier}
         return results
     
     # Edge case: No one bet on losing side - winners get their bet back + bonus from house
     if losing_pool_total == 0:
         for uid, amount in winning_bets.items():
             bonus = max(1, int(amount * 0.20))  # 20% bonus for correct prediction, min 1
-            results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side}
+            # Apply win multiplier if they bet on win
+            if winning_side == "win":
+                multiplier = round(random.uniform(1.05, 1.20), 2)
+                bonus = int(bonus * multiplier)
+            else:
+                multiplier = None
+            results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side, "multiplier": multiplier}
         return results
     
     # Normal case: Pari-mutuel payout
@@ -855,8 +869,16 @@ def calculate_payouts(bet_data: dict, outcome: str) -> dict:
     for uid, amount in winning_bets.items():
         share = amount / winning_pool_total
         payout = int(payout_pool * share)
+        
+        # Apply win multiplier if they bet on win (not loss)
+        if winning_side == "win":
+            multiplier = round(random.uniform(1.05, 1.20), 2)
+            payout = int(payout * multiplier)
+        else:
+            multiplier = None
+        
         profit = payout - amount
-        results[uid] = {"payout": payout, "profit": profit, "bet": amount, "side": winning_side}
+        results[uid] = {"payout": payout, "profit": profit, "bet": amount, "side": winning_side, "multiplier": multiplier}
     
     return results
 
@@ -923,8 +945,10 @@ async def resolve_bets(bet_key: tuple, outcome: str):
         except:
             name = f"User {uid[:8]}"
         
+        multiplier_text = f" (🎲 {result['multiplier']}x)" if result.get('multiplier') else ""
+        
         if result["profit"] > 0:
-            winners_text.append(f"🤑 **{name}**: +{result['profit']} coins (bet {result['bet']} on {result['side']})")
+            winners_text.append(f"🤑 **{name}**: +{result['profit']} coins{multiplier_text} (bet {result['bet']} on {result['side']})")
         elif result["profit"] == 0:
             winners_text.append(f"😐 **{name}**: ±0 coins (bet {result['bet']} on {result['side']})")
         else:
@@ -1198,10 +1222,12 @@ async def bet(interaction: discord.Interaction, player: discord.Member, outcome:
     
     new_balance = get_balance(user_id)
     
+    multiplier_note = "\n🎲 **Win bets get 1.05-1.2x random bonus!**" if outcome == "win" else ""
+    
     await interaction.response.send_message(
         f"✅ Bet placed!\n\n"
         f"**{amount}** coins on **{player.display_name}** to **{outcome.upper()}**\n"
-        f"Potential payout: ~**{potential_payout}** coins (odds may change)\n"
+        f"Potential payout: ~**{potential_payout}** coins (odds may change){multiplier_note}\n"
         f"Your balance: **{new_balance}** coins",
         ephemeral=True
     )
@@ -1273,19 +1299,18 @@ async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="give", description="Give coins to another user (Admin only)")
+@bot.tree.command(name="set", description="Set a user's coin balance (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
-async def give(interaction: discord.Interaction, user: discord.Member, amount: int):
-    """Give coins to a user (admin only)."""
+async def set_coins(interaction: discord.Interaction, user: discord.Member, amount: int):
+    """Set a user's coin balance (admin only)."""
     user_id = str(user.id)
-    new_balance = update_balance(user_id, amount)
+    new_balance = set_balance(user_id, amount)
     
     await interaction.response.send_message(
-        f"✅ Gave **{amount}** coins to **{user.display_name}**\n"
-        f"Their new balance: **{new_balance}** coins"
+        f"✅ Set **{user.display_name}**'s balance to **{new_balance}** coins"
     )
     
-    print(f"💰 Admin {interaction.user.display_name} gave {amount} coins to {user.display_name}")
+    print(f"💰 Admin {interaction.user.display_name} set {user.display_name}'s balance to {new_balance}")
 
 
 # Run the bot
