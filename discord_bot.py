@@ -1366,7 +1366,7 @@ async def rules(interaction: discord.Interaction):
     
     embed.set_footer(text="Good luck, have fun! 🎯")
     
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # Run the bot
