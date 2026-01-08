@@ -160,10 +160,20 @@ async def on_ready():
     print(f"{'='*50}")
     print(f"✅ {bot.user} is online!")
     print(f"{'='*50}")
+    print(f"📂 Data directory: {DATA_DIR}")
+    print(f"📂 Data file: {DATA_FILE}")
+    print(f"📂 Settings file: {SETTINGS_FILE}")
     print(f"📊 Registered users: {len(user_data)}")
+    for uid, info in user_data.items():
+        print(f"   └─ {uid}: {info.get('riot_name')}#{info.get('riot_tag')} ({info.get('region')})")
     print(f"📢 Announcement channels: {len(announcement_channels)}")
+    for gid, cid in announcement_channels.items():
+        print(f"   └─ Guild {gid}: Channel {cid}")
     print(f"🎮 Tracking modes: {ALLOWED_MODES if ALLOWED_MODES else 'all'}")
     print(f"⏱️ Poll interval: {POLL_INTERVAL}s")
+    print(f"🔗 Connected to {len(bot.guilds)} guild(s):")
+    for guild in bot.guilds:
+        print(f"   └─ {guild.name} ({guild.id}) - {guild.member_count} members")
     print(f"{'='*50}")
     
     # Start the polling loop
@@ -186,6 +196,16 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     """Triggered when a member's presence changes."""
     user_id = str(after.id)
     
+    # Log ALL presence changes with full details
+    before_activities = [f"{type(a).__name__}:{getattr(a, 'name', '?')}" for a in before.activities]
+    after_activities = [f"{type(a).__name__}:{getattr(a, 'name', '?')}" for a in after.activities]
+    
+    if before_activities != after_activities:
+        print(f"👀 Presence: {after.display_name} ({user_id})")
+        print(f"   Before: {before_activities if before_activities else 'none'}")
+        print(f"   After:  {after_activities if after_activities else 'none'}")
+        print(f"   Registered: {user_id in user_data}")
+    
     # Check if user is registered
     if user_id not in user_data:
         return
@@ -193,14 +213,17 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     before_valorant = get_valorant_activity(before)
     after_valorant = get_valorant_activity(after)
     
+    print(f"   Valorant before: {before_valorant}")
+    print(f"   Valorant after:  {after_valorant}")
+    
     # User started playing Valorant
     if not before_valorant and after_valorant:
-        print(f"👀 Presence: {after.display_name} started Valorant")
+        print(f"🎮 VALORANT STARTED: {after.display_name}")
         await start_tracking(after)
     
-    # User stopped playing Valorant (backup - polling should catch match end first)
+    # User stopped playing Valorant
     elif before_valorant and not after_valorant:
-        print(f"👀 Presence: {after.display_name} stopped Valorant")
+        print(f"🛑 VALORANT STOPPED: {after.display_name}")
         if user_id in active_sessions:
             print(f"   └─ Still in active_sessions, waiting for poller to detect match end")
 
@@ -549,10 +572,12 @@ async def create_announcement(players_in_match: list):
 def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
     """Check if member is playing Valorant."""
     for activity in member.activities:
-        if isinstance(activity, discord.Game) and "valorant" in activity.name.lower():
-            return activity
-        if isinstance(activity, discord.Activity) and activity.name and "valorant" in activity.name.lower():
-            return activity
+        activity_name = getattr(activity, 'name', None)
+        if activity_name:
+            if isinstance(activity, discord.Game) and "valorant" in activity_name.lower():
+                return activity
+            if isinstance(activity, discord.Activity) and "valorant" in activity_name.lower():
+                return activity
     return None
 
 
@@ -621,6 +646,7 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
     """Set the announcement channel for this server."""
     announcement_channels[interaction.guild.id] = channel.id
     save_settings()
+    print(f"📢 Announcement channel set: Guild {interaction.guild.id} ({interaction.guild.name}) -> Channel {channel.id} (#{channel.name})")
     await interaction.response.send_message(f"✅ Match announcements will be posted in {channel.mention}")
 
 
