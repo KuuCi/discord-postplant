@@ -1,0 +1,7 @@
+user_data.json
+settings.json
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
