@@ -717,7 +717,7 @@ async def open_betting(member: discord.Member, user_info: dict):
     embed.add_field(name="💰 Win Pool", value="0 coins (0 bets)", inline=True)
     embed.add_field(name="💀 Loss Pool", value="0 coins (0 bets)", inline=True)
     embed.add_field(name="📊 Win Odds", value="--", inline=True)
-    embed.set_footer(text="Win bets get 1.05-1.2x bonus • House takes 5% on pools 100+")
+    embed.set_footer(text="Win bets get 1.05-1.2x bonus • Player wins = 15% pot + 20 coins")
     
     msg = await channel.send(embed=embed)
     active_bets[bet_key]["message"] = msg
@@ -894,8 +894,29 @@ async def resolve_bets(bet_key: tuple, outcome: str):
     loss_pool = sum(bet_data["bets"]["loss"].values())
     total_pool = win_pool + loss_pool
     
+    # Player win bonus: 15% of pot + 20 coins
+    player_user_id = bet_key[1]  # The player being bet on
+    player_bonus = 0
+    if outcome == "win" and total_pool > 0:
+        player_bonus = int(total_pool * 0.15) + 20
+        update_balance(player_user_id, player_bonus)
+        print(f"🏆 Player {player_user_id} won! Bonus: {player_bonus} coins (15% of {total_pool} + 20)")
+    elif outcome == "win":
+        # No bets but still won - just give 20 coins
+        player_bonus = 20
+        update_balance(player_user_id, player_bonus)
+        print(f"🏆 Player {player_user_id} won! Bonus: 20 coins")
+    
     if total_pool == 0:
         print(f"🎰 No bets placed for {bet_data['player_name']}")
+        # Still announce player bonus if they won
+        if player_bonus > 0:
+            guild = bot.get_guild(bet_data["guild_id"])
+            channel_id = announcement_channels.get(bet_data["guild_id"])
+            if guild and channel_id:
+                channel = guild.get_channel(channel_id)
+                if channel:
+                    await channel.send(f"🏆 **{bet_data['player_name']}** won their match! +**{player_bonus}** coins")
         return
     
     # Calculate payouts
@@ -926,6 +947,14 @@ async def resolve_bets(bet_key: tuple, outcome: str):
         color=discord.Color.green() if outcome == "win" else discord.Color.red(),
         timestamp=datetime.now(timezone.utc)
     )
+    
+    # Add player bonus field if they won
+    if player_bonus > 0:
+        embed.add_field(
+            name="🏆 Player Bonus",
+            value=f"**{bet_data['player_name']}** earned **+{player_bonus}** coins for winning!",
+            inline=False
+        )
     
     # Sort by profit
     sorted_results = sorted(payouts.items(), key=lambda x: x[1]["profit"], reverse=True)
@@ -1348,6 +1377,7 @@ async def rules(interaction: discord.Interaction):
     embed.add_field(
         name="💰 Earning Coins",
         value=(
+            "• **Win your match** → **15% of betting pot + 20 coins**\n"
             "• Spend **30 min in voice chat** → Auto-claim **50 coins** daily\n"
             "• Win bets on your friends!"
         ),
