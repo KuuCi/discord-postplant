@@ -189,6 +189,21 @@ async def on_ready():
         print(f"❌ Failed to sync commands: {e}")
     
     print(f"{'='*50}")
+    
+    # Scan for registered users already playing Valorant
+    print(f"🔍 Scanning for users already playing Valorant...")
+    for guild in bot.guilds:
+        for member in guild.members:
+            user_id = str(member.id)
+            if user_id in user_data and user_id not in active_sessions:
+                if get_valorant_activity(member):
+                    print(f"🎮 Found {member.display_name} already playing Valorant!")
+                    await start_tracking(member)
+    
+    if active_sessions:
+        print(f"✅ Now tracking {len(active_sessions)} player(s) from startup scan")
+    else:
+        print(f"✅ No registered users currently playing Valorant")
 
 
 @bot.event
