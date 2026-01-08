@@ -23,7 +23,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 user_data = {}
 
 # Track active gaming sessions
-# Format: {discord_user_id: {"member": Member, "last_match_id": str, "voice_channel_id": int, "guild_id": int, "is_streaming": bool}}
+# Format: {discord_user_id: {"member": Member, "last_match_id": str, "voice_channel_id": int, "guild_id": int, "started_at": datetime}}
 active_sessions = {}
 
 # Only track these game modes (set to None to track all modes)
@@ -242,11 +242,38 @@ async def start_tracking(member: discord.Member):
         "last_match_id": last_match_id,
         "voice_channel_id": voice_channel_id,
         "guild_id": member.guild.id,
-        "is_streaming": is_streaming_valorant(member),
         "started_at": datetime.now(timezone.utc)
     }
     
     print(f"✅ Now tracking {member.display_name} | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
+    
+    # Announce that player started a game
+    await announce_game_start(member, user_info)
+
+
+async def announce_game_start(member: discord.Member, user_info: dict):
+    """Announce that a player has started Valorant."""
+    guild = member.guild
+    channel_id = announcement_channels.get(guild.id)
+    
+    if not channel_id:
+        print(f"⚠️ No announcement channel set for guild {guild.name}")
+        return
+    
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        print(f"❌ Could not find announcement channel {channel_id}")
+        return
+    
+    embed = discord.Embed(
+        title=f"🎮 {member.display_name} is now playing Valorant!",
+        description=f"**{user_info['riot_name']}#{user_info['riot_tag']}**",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    
+    await channel.send(embed=embed)
+    print(f"✅ Game start announcement sent for {member.display_name}")
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -420,15 +447,10 @@ async def create_announcement(players_in_match: list):
     
     # Collect player stats
     player_stats = []
-    any_streaming = False
     
     for p in players_in_match:
         member = p["member"]
-        session = p["session"]
         user_info = p["user_info"]
-        
-        if session.get("is_streaming"):
-            any_streaming = True
         
         # Find player in match data
         player_data = None
@@ -497,9 +519,8 @@ async def create_announcement(players_in_match: list):
             inline=False
         )
     
-    streaming_note = " 📺 Streaming" if any_streaming else ""
     riot_ids = ", ".join(ps["riot_id"] for ps in player_stats)
-    embed.set_footer(text=f"{riot_ids}{streaming_note}")
+    embed.set_footer(text=riot_ids)
     
     # Send to announcement channel
     guild = player_stats[0]["member"].guild
@@ -533,15 +554,6 @@ def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
         if isinstance(activity, discord.Activity) and activity.name and "valorant" in activity.name.lower():
             return activity
     return None
-
-
-def is_streaming_valorant(member: discord.Member) -> bool:
-    """Check if member is streaming Valorant."""
-    for activity in member.activities:
-        if isinstance(activity, discord.Streaming):
-            if activity.game and "valorant" in activity.game.lower():
-                return True
-    return False
 
 
 # Slash Commands
