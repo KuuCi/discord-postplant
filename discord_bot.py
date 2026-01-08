@@ -270,63 +270,6 @@ async def on_ready():
 
 
 @bot.event
-async def on_member_join(member: discord.Member):
-    """Send welcome message with rules when someone joins."""
-    guild = member.guild
-    channel_id = announcement_channels.get(guild.id)
-    
-    if not channel_id:
-        return
-    
-    channel = guild.get_channel(channel_id)
-    if not channel:
-        return
-    
-    embed = discord.Embed(
-        title=f"👋 Welcome to {guild.name}, {member.display_name}!",
-        description="Here's how the **Post Plant** bot works:",
-        color=discord.Color.blue()
-    )
-    
-    embed.add_field(
-        name="🎮 Match Tracking",
-        value=(
-            "• `/register <RiotName> <TAG> <region>` - Register your Riot ID\n"
-            "• When you play Valorant, your match results get posted here\n"
-            "• `/stats` - Check your recent stats"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🎰 Betting System",
-        value=(
-            "• Everyone starts with **100 coins**\n"
-            "• When someone starts a match, betting opens for 3 min\n"
-            "• `/bet <player> <win|loss> <amount>` - Place a bet\n"
-            "• Win bets get a **1.05-1.2x bonus** multiplier!\n"
-            "• `/balance` - Check your coins\n"
-            "• `/leaderboard` - See top coin holders"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="💰 Earning Coins",
-        value=(
-            "• Spend **30 min in voice chat** → Auto-claim **50 coins** daily\n"
-            "• Win bets on your friends!"
-        ),
-        inline=False
-    )
-    
-    embed.set_footer(text="Good luck, have fun! 🎯")
-    
-    await channel.send(embed=embed)
-    print(f"👋 Sent welcome message for {member.display_name}")
-
-
-@bot.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
     """Triggered when a member's presence changes."""
     user_id = str(after.id)
