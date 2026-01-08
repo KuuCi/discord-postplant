@@ -660,14 +660,6 @@ async def create_announcement(players_in_match: list):
     else:
         print(f"⚠️ No announcement channel set for guild {guild.name}")
     
-    # DM each player
-    for ps in player_stats:
-        try:
-            await ps["member"].send(embed=embed)
-            print(f"✅ DM sent to {ps['member'].display_name}")
-        except discord.Forbidden:
-            print(f"⚠️ Could not DM {ps['member'].display_name} (DMs disabled)")
-    
     # Resolve bets for each player
     for ps in player_stats:
         bet_key = (guild.id, str(ps["member"].id))
@@ -724,7 +716,7 @@ async def open_betting(member: discord.Member, user_info: dict):
     embed.add_field(name="💰 Win Pool", value="0 coins (0 bets)", inline=True)
     embed.add_field(name="💀 Loss Pool", value="0 coins (0 bets)", inline=True)
     embed.add_field(name="📊 Win Odds", value="--", inline=True)
-    embed.set_footer(text="House takes 10% • Use /bet to place your wager")
+    embed.set_footer(text="House takes 5% on pools 100+ coins • Use /bet to place your wager")
     
     msg = await channel.send(embed=embed)
     active_bets[bet_key]["message"] = msg
@@ -780,13 +772,16 @@ async def update_betting_embed(bet_key: tuple):
     loss_bettors = len(bet_data["bets"]["loss"])
     
     # Calculate odds (potential payout multiplier for a 1 coin bet)
+    # House takes 5% only on pools >= 100
+    house_mult = 0.95 if total_pool >= 100 else 1.0
+    
     if total_pool > 0 and win_pool > 0:
-        win_odds = f"{((total_pool * 0.9) / win_pool):.2f}x"
+        win_odds = f"{((total_pool * house_mult) / win_pool):.2f}x"
     else:
         win_odds = "--"
     
     if total_pool > 0 and loss_pool > 0:
-        loss_odds = f"{((total_pool * 0.9) / loss_pool):.2f}x"
+        loss_odds = f"{((total_pool * house_mult) / loss_pool):.2f}x"
     else:
         loss_odds = "--"
     
@@ -800,15 +795,22 @@ async def update_betting_embed(bet_key: tuple):
         pass
 
 
-def calculate_payouts(bet_data: dict, outcome: str, house_cut: float = 0.10) -> dict:
+def calculate_payouts(bet_data: dict, outcome: str) -> dict:
     """
     Calculate payouts for all bettors.
+    House takes 5% only on pools of 100+ coins.
     Returns: {user_id: {"payout": int, "profit": int, "bet": int, "side": str}}
     """
     bets = bet_data["bets"]
     win_pool = sum(bets["win"].values())
     loss_pool = sum(bets["loss"].values())
     total_pool = win_pool + loss_pool
+    
+    # House cut: 5% only on pools >= 100 coins
+    if total_pool >= 100:
+        house_cut = 0.05
+    else:
+        house_cut = 0.0
     
     winning_side = "win" if outcome == "win" else "loss"
     losing_side = "loss" if outcome == "win" else "win"
@@ -832,17 +834,17 @@ def calculate_payouts(bet_data: dict, outcome: str, house_cut: float = 0.10) -> 
     if winning_pool_total == 0:
         return results
     
-    # Edge case: No one bet on losing side - winners get small bonus
-    if losing_pool_total == 0:
+    # Edge case: Only one person bet total - return their bet + bonus from house
+    if len(winning_bets) + len(losing_bets) == 1:
         for uid, amount in winning_bets.items():
-            bonus = int(amount * 0.05)  # 5% bonus for "sure thing"
+            bonus = max(1, int(amount * 0.25))  # 25% bonus for being brave, min 1
             results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side}
         return results
     
-    # Edge case: Only one person bet total - return their bet + small bonus
-    if len(winning_bets) + len(losing_bets) == 1:
+    # Edge case: No one bet on losing side - winners get their bet back + bonus from house
+    if losing_pool_total == 0:
         for uid, amount in winning_bets.items():
-            bonus = int(amount * 0.10)  # 10% bonus for being brave
+            bonus = max(1, int(amount * 0.20))  # 20% bonus for correct prediction, min 1
             results[uid] = {"payout": amount + bonus, "profit": bonus, "bet": amount, "side": winning_side}
         return results
     
@@ -933,8 +935,20 @@ async def resolve_bets(bet_key: tuple, outcome: str):
     if losers_text:
         embed.add_field(name="Losers", value="\n".join(losers_text[:10]) or "None", inline=False)
     
-    house_take = int(total_pool * 0.10) if len(payouts) > 1 else 0
-    embed.set_footer(text=f"Total pool: {total_pool} coins • House took: {house_take} coins")
+    # Check if house gave bonus or took cut
+    win_bettors = len(bet_data["bets"]["win"])
+    loss_bettors = len(bet_data["bets"]["loss"])
+    winning_side_count = win_bettors if outcome == "win" else loss_bettors
+    losing_side_count = loss_bettors if outcome == "win" else win_bettors
+    
+    if losing_side_count == 0 or (win_bettors + loss_bettors) == 1:
+        # House gave bonus
+        embed.set_footer(text=f"Total pool: {total_pool} coins • House bonus paid out 🎁")
+    elif total_pool >= 100:
+        house_take = int(total_pool * 0.05)
+        embed.set_footer(text=f"Total pool: {total_pool} coins • House took: {house_take} coins")
+    else:
+        embed.set_footer(text=f"Total pool: {total_pool} coins")
     
     # Ping all bettors
     ping_text = " ".join(mentions) if mentions else ""
@@ -1173,8 +1187,11 @@ async def bet(interaction: discord.Interaction, player: discord.Member, outcome:
     total_pool = win_pool + loss_pool
     my_pool = win_pool if outcome == "win" else loss_pool
     
+    # House takes 5% only on pools >= 100
+    house_mult = 0.95 if total_pool >= 100 else 1.0
+    
     if my_pool > 0:
-        potential_multiplier = (total_pool * 0.9) / my_pool
+        potential_multiplier = (total_pool * house_mult) / my_pool
         potential_payout = int(amount * potential_multiplier)
     else:
         potential_payout = amount
