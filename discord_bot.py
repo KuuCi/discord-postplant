@@ -279,22 +279,58 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     after_activities = [f"{type(a).__name__}:{getattr(a, 'name', '?')}" for a in after.activities]
     
     if before_activities != after_activities:
-        print(f"👀 Presence: {after.display_name} ({user_id})")
-        print(f"   Before: {before_activities if before_activities else 'none'}")
-        print(f"   After:  {after_activities if after_activities else 'none'}")
+        print(f"{'='*60}")
+        print(f"👀 PRESENCE CHANGE: {after.display_name} ({user_id})")
         print(f"   Registered: {user_id in user_data}")
+        print(f"   Before activities: {before_activities if before_activities else 'none'}")
+        print(f"   After activities:  {after_activities if after_activities else 'none'}")
     
-    # Log detailed Valorant activity info
+    # Log EVERYTHING about each activity
     for activity in after.activities:
-        if hasattr(activity, 'name') and activity.name and 'valorant' in activity.name.lower():
-            print(f"   🎮 VALORANT DETAILS:")
-            print(f"      Type: {type(activity).__name__}")
-            print(f"      Details: {getattr(activity, 'details', None)}")
-            print(f"      State: {getattr(activity, 'state', None)}")
-            print(f"      Large text: {getattr(activity, 'large_image_text', None)}")
-            print(f"      Small text: {getattr(activity, 'small_image_text', None)}")
-            if hasattr(activity, 'timestamps'):
-                print(f"      Timestamps: {activity.timestamps}")
+        print(f"   {'─'*50}")
+        print(f"   📦 ACTIVITY: {type(activity).__name__}")
+        print(f"      name: {getattr(activity, 'name', None)}")
+        print(f"      type: {getattr(activity, 'type', None)}")
+        
+        # All possible attributes
+        attrs_to_check = [
+            'details', 'state', 'url', 'application_id',
+            'assets', 'party', 'timestamps', 'buttons',
+            'large_image_url', 'large_image_text', 
+            'small_image_url', 'small_image_text',
+            'start', 'end', 'emoji', 'session_id',
+            'sync_id', 'platform', 'created_at'
+        ]
+        
+        for attr in attrs_to_check:
+            val = getattr(activity, attr, None)
+            if val is not None:
+                print(f"      {attr}: {val}")
+        
+        # If it has assets, dig deeper
+        if hasattr(activity, 'assets') and activity.assets:
+            print(f"      ASSETS:")
+            for key in ['large_image', 'large_text', 'small_image', 'small_text']:
+                val = getattr(activity.assets, key, None) if hasattr(activity.assets, key) else activity.assets.get(key) if isinstance(activity.assets, dict) else None
+                if val:
+                    print(f"         {key}: {val}")
+        
+        # If it has party info
+        if hasattr(activity, 'party') and activity.party:
+            print(f"      PARTY: {activity.party}")
+        
+        # If it has timestamps
+        if hasattr(activity, 'timestamps') and activity.timestamps:
+            print(f"      TIMESTAMPS: {activity.timestamps}")
+        
+        # Raw dict if available
+        if hasattr(activity, 'to_dict'):
+            try:
+                print(f"      RAW DICT: {activity.to_dict()}")
+            except:
+                pass
+    
+    print(f"{'='*60}")
     
     # Check if user is registered
     if user_id not in user_data:
@@ -303,8 +339,8 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     before_valorant = get_valorant_activity(before)
     after_valorant = get_valorant_activity(after)
     
-    print(f"   Valorant before: {before_valorant}")
-    print(f"   Valorant after:  {after_valorant}")
+    print(f"   🎮 Valorant before: {before_valorant}")
+    print(f"   🎮 Valorant after:  {after_valorant}")
     
     # User started playing Valorant
     if not before_valorant and after_valorant:
