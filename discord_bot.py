@@ -339,8 +339,13 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
     before_valorant = get_valorant_activity(before)
     after_valorant = get_valorant_activity(after)
     
+    before_state = get_valorant_game_state(before)
+    after_state = get_valorant_game_state(after)
+    
     print(f"   🎮 Valorant before: {before_valorant}")
     print(f"   🎮 Valorant after:  {after_valorant}")
+    print(f"   🎮 State before: {before_state}")
+    print(f"   🎮 State after:  {after_state}")
     
     # User started playing Valorant
     if not before_valorant and after_valorant:
@@ -352,6 +357,26 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         print(f"🛑 VALORANT STOPPED: {after.display_name}")
         if user_id in active_sessions:
             print(f"   └─ Still in active_sessions, waiting for poller to detect match end")
+    
+    # User entered Agent Select - OPEN BETTING!
+    elif before_state and after_state:
+        before_in_select = "agent select" in before_state.lower()
+        after_in_select = "agent select" in after_state.lower()
+        
+        if not before_in_select and after_in_select:
+            print(f"🎯 AGENT SELECT DETECTED: {after.display_name}")
+            user_info = user_data.get(user_id)
+            if user_info:
+                # Make sure they're being tracked
+                if user_id not in active_sessions:
+                    await start_tracking_silent(after)
+                
+                # Open betting
+                bet_key = (after.guild.id, user_id)
+                if bet_key not in active_bets:
+                    await open_betting(after, user_info)
+                else:
+                    print(f"   └─ Betting already open for {after.display_name}")
 
 
 @bot.event
@@ -414,6 +439,42 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 pass
 
 
+async def start_tracking_silent(member: discord.Member):
+    """Start tracking a player without opening betting (for mid-session detection)."""
+    user_id = str(member.id)
+    user_info = user_data.get(user_id)
+    
+    if not user_info:
+        return
+    
+    print(f"🎮 {member.display_name} - adding to tracking silently...")
+    
+    # Get their current last match (so we know when a NEW one appears)
+    last_match = await valorant_api.get_last_match(
+        user_info["riot_name"],
+        user_info["riot_tag"],
+        user_info.get("region", "na")
+    )
+    
+    last_match_id = None
+    if last_match:
+        last_match_id = last_match["metadata"]["matchid"]
+    
+    voice_channel_id = None
+    if member.voice and member.voice.channel:
+        voice_channel_id = member.voice.channel.id
+    
+    active_sessions[user_id] = {
+        "member": member,
+        "last_match_id": last_match_id,
+        "voice_channel_id": voice_channel_id,
+        "guild_id": member.guild.id,
+        "started_at": datetime.now(timezone.utc)
+    }
+    
+    print(f"✅ Now tracking {member.display_name} (silent) | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
+
+
 async def start_tracking(member: discord.Member):
     """Start tracking a player's match."""
     user_id = str(member.id)
@@ -457,12 +518,10 @@ async def start_tracking(member: discord.Member):
     
     print(f"✅ Now tracking {member.display_name} | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
     
-    # Only open betting if match is recent (player likely in active session)
-    # Otherwise wait silently for a new match to complete
-    if match_is_recent:
+    # Check if already in agent select - if so, open betting immediately
+    if is_in_agent_select(member):
+        print(f"🎯 Already in agent select - opening betting!")
         await open_betting(member, user_info)
-    else:
-        print(f"⏳ Skipping betting (last match too old) - will announce when new match completes")
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -760,11 +819,58 @@ def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
     for activity in member.activities:
         activity_name = getattr(activity, 'name', None)
         if activity_name:
+            # Check for Valorant Tracker App (has detailed game state)
+            if "valorant tracker" in activity_name.lower():
+                return activity
+            # Check for base Valorant
             if isinstance(activity, discord.Game) and "valorant" in activity_name.lower():
                 return activity
             if isinstance(activity, discord.Activity) and "valorant" in activity_name.lower():
                 return activity
     return None
+
+
+def get_valorant_game_state(member: discord.Member) -> Optional[str]:
+    """Get the current Valorant game state from Tracker App presence.
+    
+    Returns states like:
+    - "In Main Menu"
+    - "Swiftplay: In Queue"
+    - "Swiftplay: Agent Select"
+    - "Competitive: Agent Select"
+    - "Swiftplay: In Game"
+    - "Competitive: In Game"
+    - etc.
+    """
+    for activity in member.activities:
+        activity_name = getattr(activity, 'name', None)
+        if activity_name and "valorant tracker" in activity_name.lower():
+            return getattr(activity, 'details', None)
+    return None
+
+
+def is_in_agent_select(member: discord.Member) -> bool:
+    """Check if player is in agent select (match starting)."""
+    state = get_valorant_game_state(member)
+    if state:
+        return "agent select" in state.lower()
+    return False
+
+
+def is_in_game(member: discord.Member) -> bool:
+    """Check if player is actively in a game."""
+    state = get_valorant_game_state(member)
+    if state:
+        return "in game" in state.lower()
+    return False
+
+
+def is_in_menu(member: discord.Member) -> bool:
+    """Check if player is in main menu."""
+    state = get_valorant_game_state(member)
+    if state:
+        return "main menu" in state.lower() or "in queue" in state.lower()
+    return False
 
 
 # ==================== BETTING SYSTEM ====================
