@@ -263,12 +263,16 @@ async def on_ready():
                     print(f"🎮 Found {member.display_name} already playing Valorant!")
                     await start_tracking(member)
                     
-                    # Check if already in game
-                    if is_in_game(member):
-                        user_info = user_data.get(user_id)
-                        if user_info:
-                            print(f"🎯 Already in game - opening betting!")
-                            await open_betting(member, user_info)
+                    # Only open betting if Valorant Tracker is detected AND already in game
+                    game_state = get_valorant_game_state(member)
+                    if game_state:  # Tracker detected
+                        if is_in_game(member):
+                            user_info = user_data.get(user_id)
+                            if user_info:
+                                print(f"🎯 Already in game (Tracker detected) - opening betting!")
+                                await open_betting(member, user_info)
+                    else:
+                        print(f"   └─ No Valorant Tracker detected - betting disabled for {member.display_name}")
     
     if active_sessions:
         print(f"✅ Now tracking {len(active_sessions)} player(s) from startup scan")
@@ -366,7 +370,8 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
             print(f"   └─ Still in active_sessions, waiting for poller to detect match end")
     
     # Detect game start - state changes TO "In Game"
-    elif before_state and after_state:
+    # This ONLY works if Valorant Tracker App is running (provides game state)
+    if after_state:  # Tracker detected
         before_in_game = is_in_game_state(before_state)
         after_in_game = is_in_game_state(after_state)
         
