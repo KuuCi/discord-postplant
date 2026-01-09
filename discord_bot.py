@@ -262,6 +262,13 @@ async def on_ready():
                 if get_valorant_activity(member):
                     print(f"🎮 Found {member.display_name} already playing Valorant!")
                     await start_tracking(member)
+                    
+                    # Check if already in game
+                    if is_in_game(member):
+                        user_info = user_data.get(user_id)
+                        if user_info:
+                            print(f"🎯 Already in game - opening betting!")
+                            await open_betting(member, user_info)
     
     if active_sessions:
         print(f"✅ Now tracking {len(active_sessions)} player(s) from startup scan")
@@ -358,13 +365,13 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         if user_id in active_sessions:
             print(f"   └─ Still in active_sessions, waiting for poller to detect match end")
     
-    # User entered Agent Select - OPEN BETTING!
+    # Detect game start - state changes TO "In Game"
     elif before_state and after_state:
-        before_in_select = "agent select" in before_state.lower()
-        after_in_select = "agent select" in after_state.lower()
+        before_in_game = is_in_game_state(before_state)
+        after_in_game = is_in_game_state(after_state)
         
-        if not before_in_select and after_in_select:
-            print(f"🎯 AGENT SELECT DETECTED: {after.display_name}")
+        if not before_in_game and after_in_game:
+            print(f"🎯 IN GAME DETECTED: {after.display_name} - {after_state}")
             user_info = user_data.get(user_id)
             if user_info:
                 # Make sure they're being tracked
@@ -493,16 +500,8 @@ async def start_tracking(member: discord.Member):
     )
     
     last_match_id = None
-    match_is_recent = False
-    
     if last_match:
         last_match_id = last_match["metadata"]["matchid"]
-        # Check if match is recent (within last 3 hours)
-        match_timestamp = last_match["metadata"].get("game_start", 0)
-        if match_timestamp:
-            match_age_hours = (datetime.now(timezone.utc).timestamp() - match_timestamp) / 3600
-            match_is_recent = match_age_hours < 3
-            print(f"📅 Last match was {match_age_hours:.1f} hours ago (recent: {match_is_recent})")
     
     voice_channel_id = None
     if member.voice and member.voice.channel:
@@ -518,10 +517,7 @@ async def start_tracking(member: discord.Member):
     
     print(f"✅ Now tracking {member.display_name} | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
     
-    # Check if already in agent select - if so, open betting immediately
-    if is_in_agent_select(member):
-        print(f"🎯 Already in agent select - opening betting!")
-        await open_betting(member, user_info)
+    # Don't open betting here - wait for Agent Select detection
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -808,10 +804,7 @@ async def create_announcement(players_in_match: list):
                 "guild_id": guild.id,
                 "started_at": datetime.now(timezone.utc)
             }
-            print(f"🔄 Re-tracking {member.display_name} for next game")
-            
-            # Open betting for their next game
-            await open_betting(member, user_info)
+            print(f"🔄 Re-tracking {member.display_name} for next game (betting opens when game starts)")
 
 
 def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
@@ -860,8 +853,31 @@ def is_in_agent_select(member: discord.Member) -> bool:
 def is_in_game(member: discord.Member) -> bool:
     """Check if player is actively in a game."""
     state = get_valorant_game_state(member)
-    if state:
-        return "in game" in state.lower()
+    return is_in_game_state(state)
+
+
+def is_in_game_state(state: Optional[str]) -> bool:
+    """Check if a state string indicates being in a game.
+    
+    Matches patterns like:
+    - "Swiftplay: 0 - 0"
+    - "Competitive: 5 - 3"
+    - "Swiftplay: In Game"
+    - Contains score pattern like "X - Y"
+    """
+    if not state:
+        return False
+    state_lower = state.lower()
+    
+    # Explicit "in game" text
+    if "in game" in state_lower:
+        return True
+    
+    # Score pattern (e.g., "Swiftplay: 0 - 0", "Competitive: 5 - 3")
+    import re
+    if re.search(r'\d+\s*-\s*\d+', state):
+        return True
+    
     return False
 
 
