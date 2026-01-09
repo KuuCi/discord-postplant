@@ -284,6 +284,18 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         print(f"   After:  {after_activities if after_activities else 'none'}")
         print(f"   Registered: {user_id in user_data}")
     
+    # Log detailed Valorant activity info
+    for activity in after.activities:
+        if hasattr(activity, 'name') and activity.name and 'valorant' in activity.name.lower():
+            print(f"   🎮 VALORANT DETAILS:")
+            print(f"      Type: {type(activity).__name__}")
+            print(f"      Details: {getattr(activity, 'details', None)}")
+            print(f"      State: {getattr(activity, 'state', None)}")
+            print(f"      Large text: {getattr(activity, 'large_image_text', None)}")
+            print(f"      Small text: {getattr(activity, 'small_image_text', None)}")
+            if hasattr(activity, 'timestamps'):
+                print(f"      Timestamps: {activity.timestamps}")
+    
     # Check if user is registered
     if user_id not in user_data:
         return
@@ -376,12 +388,24 @@ async def start_tracking(member: discord.Member):
     
     print(f"🎮 {member.display_name} started Valorant - fetching last match ID...")
     
-    # Get their current last match ID (so we know when a NEW one appears)
-    last_match_id = await valorant_api.get_last_match_id(
+    # Get their current last match (so we know when a NEW one appears)
+    last_match = await valorant_api.get_last_match(
         user_info["riot_name"],
         user_info["riot_tag"],
         user_info.get("region", "na")
     )
+    
+    last_match_id = None
+    match_is_recent = False
+    
+    if last_match:
+        last_match_id = last_match["metadata"]["matchid"]
+        # Check if match is recent (within last 3 hours)
+        match_timestamp = last_match["metadata"].get("game_start", 0)
+        if match_timestamp:
+            match_age_hours = (datetime.now(timezone.utc).timestamp() - match_timestamp) / 3600
+            match_is_recent = match_age_hours < 3
+            print(f"📅 Last match was {match_age_hours:.1f} hours ago (recent: {match_is_recent})")
     
     voice_channel_id = None
     if member.voice and member.voice.channel:
@@ -397,8 +421,12 @@ async def start_tracking(member: discord.Member):
     
     print(f"✅ Now tracking {member.display_name} | Last match: {last_match_id[:8] if last_match_id else 'None'}... | Active sessions: {len(active_sessions)}")
     
-    # Open betting for this player
-    await open_betting(member, user_info)
+    # Only open betting if match is recent (player likely in active session)
+    # Otherwise wait silently for a new match to complete
+    if match_is_recent:
+        await open_betting(member, user_info)
+    else:
+        print(f"⏳ Skipping betting (last match too old) - will announce when new match completes")
 
 
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -666,6 +694,29 @@ async def create_announcement(players_in_match: list):
         bet_key = (guild.id, str(ps["member"].id))
         outcome = "win" if ps["won"] else "loss"
         await resolve_bets(bet_key, outcome)
+    
+    # Re-track players still in Valorant for their next game
+    await asyncio.sleep(2)  # Small delay so results appear before next betting opens
+    
+    for p in players_in_match:
+        member = p["member"]
+        user_id = p["user_id"]
+        user_info = p["user_info"]
+        match_id = match["metadata"]["matchid"]
+        
+        if user_info and get_valorant_activity(member):
+            # Re-track with current match as last_match_id
+            active_sessions[user_id] = {
+                "member": member,
+                "last_match_id": match_id,
+                "voice_channel_id": p["session"].get("voice_channel_id"),
+                "guild_id": guild.id,
+                "started_at": datetime.now(timezone.utc)
+            }
+            print(f"🔄 Re-tracking {member.display_name} for next game")
+            
+            # Open betting for their next game
+            await open_betting(member, user_info)
 
 
 def get_valorant_activity(member: discord.Member) -> Optional[discord.Activity]:
